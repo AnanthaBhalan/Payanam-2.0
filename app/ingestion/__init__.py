@@ -1,0 +1,1 @@
+"""Streaming ingestion (Kafka / Redpanda)."""

@@ -1,0 +1,36 @@
+# ---- Project Payanam --------------------------------------------------
+# Pinned to versions that ship Python 3.12/3.13 compatible wheels.
+
+# API
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.0
+
+# Solver (CP-SAT). 9.11 has no wheel for 3.13; the floor keeps the snake_case
+# helpers working while the compat shim also accepts the camelCase API.
+ortools>=9.11
+
+# Compute grid
+ray==2.40.0
+
+# Orchestration
+temporalio==1.7.0
+
+# Event bus
+confluent-kafka==2.6.1
+
+# Graph DB (the neo4j driver speaks Bolt, which Memgraph implements)
+neo4j==5.27.0
+
+# Fleet geospatial index (GEOADD / GEOSEARCH / WATCH transactions)
+redis>=5.0
+fakeredis>=2.21
+
+# Observability / utils
+structlog==24.4.0
+httpx==0.28.1
+
+# --- dev / test ---
+pytest==8.3.4
+pytest-asyncio==0.25.0

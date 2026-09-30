@@ -1,0 +1,54 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+
+# ---- Test / tooling caches ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ---- Secrets & local config ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.yaml
+
+# ---- Local data / logs ----
+*.log
+logs/
+*.sqlite
+*.db
+*.rdb
+dump.rdb
+
+# ---- Editors / OS ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Temporary test artifacts ----
+f.txt
+t.txt
+o.txt
+all.txt
