@@ -1,0 +1,20 @@
+# Ray cluster image.
+#
+# The stock rayproject/ray image has no ortools, so a submitted job cannot run
+# the CP-SAT solver, and runtime_env pip installs are unreliable here. Baking
+# the dependency in (plus the app the job executes) makes job submission
+# deterministic and offline-safe.
+FROM rayproject/ray:2.40.0-py311
+
+RUN pip install --no-cache-dir "ortools>=9.11" "redis>=5.0"
+
+# numpy 2.x is ABI-incompatible with the pyarrow shipped in this image
+# ("AttributeError: _ARRAY_API not found"), which crashes the `ray` CLI that Ray
+# Jobs uses to launch work. This MUST come after the install above, since
+# ortools pulls numpy>=2 back in as a dependency.
+RUN pip install --no-cache-dir "numpy<2" && python -c "import numpy;print('numpy', numpy.__version__)"
+
+WORKDIR /opt/payanam
+COPY app /opt/payanam/app
+
+ENV PYTHONPATH=/opt/payanam

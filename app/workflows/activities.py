@@ -313,20 +313,62 @@ async def solve_itinerary(
 ) -> Dict[str, Any]:
     """Run the CP-SAT model on the Ray cluster and return the solution dict.
 
-    Ray Client (``ray://``) is **not thread-safe**: a reference created in one
-    context resolves to an ``InProgressSentinel`` in another, which surfaces as
-    ``AttributeError: 'InProgressSentinel' object has no attribute 'id'``.
-    Temporal dispatches activities from a different asyncio context than the one
-    that called ``ray.init()``, so every Ray call is funnelled through a
-    single-worker thread pool that owns the client exclusively.
-    """
-    from ..solver.cp_router import solve_routing_task  # local import: heavy module
-    from ..solver.ray_dispatch import submit_solve
+    Uses the Ray Job **REST API**, not Ray Client. Ray Client binds its session
+    to the calling thread and is not task/thread safe, so every submission
+    from a Temporal activity failed with::
 
-    activity.logger.info("solve_itinerary dispatching to ray")
-    return await submit_solve(
-        solve_routing_task, request_payload, time_limit_seconds
+        AttributeError: 'InProgressSentinel' object has no attribute 'id'
+
+    Here Temporal POSTs a job to the dashboard, the cluster runs
+    ``app/solver/job_entrypoint.py`` which writes the itinerary to Redis, and
+    this activity polls for that key. No ray import happens in the worker.
+
+    Raises ``ApplicationError`` if submission fails, the job fails, or the
+    budget is exhausted -- the workflow's Saga then handles it.
+    """
+    import uuid
+
+    from ..fleet.state import get_fleet_state
+    from ..solver.ray_dispatch import (
+        submit_solve_job,
+        wait_for_solve_result,
     )
+
+    task_id = uuid.uuid4().hex
+    activity.logger.info("submitting ray solve job task_id=%s", task_id)
+
+    fleet = get_fleet_state()
+    redis_client = fleet.redis
+
+    try:
+        job_id = await submit_solve_job(
+            request_payload,
+            task_id=task_id,
+            time_limit_seconds=time_limit_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced as a terminal error
+        raise ApplicationError(
+            f"RAY_JOB_SUBMISSION_FAILED: {exc}", non_retryable=True
+        ) from exc
+
+    try:
+        result = await wait_for_solve_result(
+            job_id, task_id, redis_client, overall_timeout=300.0
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise ApplicationError(f"RAY_JOB_FAILED: {exc}") from exc
+    finally:
+        # Best-effort cleanup of the handoff key.
+        try:
+            await redis_client.delete(f"payanam:solve_result:{task_id}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    activity.logger.info(
+        "ray solve job %s completed for task_id=%s feasible=%s",
+        job_id, task_id, result.get("feasible"),
+    )
+    return result
 
 
 @activity.defn

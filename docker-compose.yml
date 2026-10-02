@@ -212,7 +212,10 @@ services:
 
   # --------------------------------------------------------- compute grid
   ray-head:
-    image: rayproject/ray:2.40.0-py311
+    build:
+      context: .
+      dockerfile: Dockerfile.ray
+    image: payanam-ray:2.40.0
     container_name: payanam-ray-head
     # --ray-client-server-port binds the Ray *Client* endpoint (10001). Ray
     # Client talks to this port; 6379 is the GCS port used by workers to join.
@@ -238,7 +241,10 @@ services:
       start_period: 30s
 
   ray-worker:
-    image: rayproject/ray:2.40.0-py311
+    build:
+      context: .
+      dockerfile: Dockerfile.ray
+    image: payanam-ray:2.40.0
     container_name: payanam-ray-worker
     # Joins via the GCS port (6379), advertising its own DNS name.
     command: >

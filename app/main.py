@@ -26,9 +26,6 @@ from .ingestion.stream import TrafficUpdateConsumer
 from .temporal_client import (
     connect_temporal,
     ensure_namespace,
-    init_ray,
-    ray_health_probe,
-    ray_ready,
     shutdown_ray,
 )
 from .startup import retry_async
@@ -60,7 +57,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.temporal = await retry_async("temporal", _temporal, settings=settings)
 
     # --------------------------------------------------------------- ray
-    app.state.ray_ready = init_ray(settings)
+    app.state.ray_ready = False  # Phase 6: no Ray Client in this process
 
     # ---------------------------------------------------------- memgraph
     memgraph = AsyncMemgraphClient(settings)
@@ -171,9 +168,21 @@ async def health() -> dict:
     except Exception as exc:  # noqa: BLE001 - never fail health on fleet
         fleet_info = {"configured": False, "error": str(exc)}
 
-    # Dispatch a real remote task rather than reporting "initialised": only an
-    # executed round-trip proves the compute grid genuinely schedules work.
-    ray_status = ray_health_probe()
+    # Phase 6: health now asks the Ray *dashboard* over REST. No Ray Client,
+    # no remote task, no import of ray in the API process.
+    from .solver.ray_dispatch import dashboard_url, dashboard_version
+
+    ray_version = await dashboard_version()
+    ray_status = {
+        "ready": ray_version is not None,
+        "address": settings.ray_address,
+        "dashboard": dashboard_url(),
+        "detail": (
+            f"ray {ray_version.get('ray_version')}"
+            if ray_version
+            else "dashboard unreachable"
+        ),
+    }
 
     return {
         "status": "ok" if (temporal_ok and memgraph_ok) else "degraded",
