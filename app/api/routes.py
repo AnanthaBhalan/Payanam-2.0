@@ -11,6 +11,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..config import get_settings
@@ -218,6 +219,76 @@ async def live_itinerary(workflow_id: str) -> Dict[str, Any]:
         raise HTTPException(
             status_code=409, detail=f"workflow not queryable: {exc}"
         ) from exc
+
+
+@router.get(
+    "/route/{workflow_id}/stream",
+    summary="Server-Sent Events stream of itinerary state changes",
+    response_class=StreamingResponse,
+)
+async def stream_itinerary(
+    workflow_id: str,
+    heartbeat_seconds: float = Query(default=15.0, ge=1.0, le=120.0),
+) -> StreamingResponse:
+    """Stream live Saga updates for ``workflow_id`` over SSE.
+
+    Bridges Redis Pub/Sub (``payanam:updates:{workflow_id}``, published by the
+    ``publish_itinerary_update`` activity) to the browser/mobile client. Sends a
+    comment heartbeat so proxies do not close an idle connection.
+    """
+    import asyncio
+    import json as _json
+
+    import redis.asyncio as aioredis
+
+    settings = get_settings()
+    channel = f"payanam:updates:{workflow_id}"
+
+    async def event_source():
+        client = aioredis.from_url(settings.redis_url, decode_responses=True)
+        pubsub = client.pubsub()
+        try:
+            await pubsub.subscribe(channel)
+            # Tell the client we are live before any itinerary event.
+            yield f"event: ready\ndata: {_json.dumps({'channel': channel})}\n\n"
+            while True:
+                try:
+                    message = await pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=1.0
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - keep the socket alive
+                    log.warning("pubsub read failed: %s", exc)
+                    await asyncio.sleep(1.0)
+                    continue
+
+                if message and message.get("type") == "message":
+                    yield f"data: {message['data']}\n\n"
+                else:
+                    # Idle: emit an SSE comment as a keep-alive.
+                    yield ": keep-alive\n\n"
+                    await asyncio.sleep(heartbeat_seconds)
+        except asyncio.CancelledError:
+            log.info("SSE client disconnected from %s", channel)
+            raise
+        finally:
+            try:
+                await pubsub.unsubscribe(channel)
+                await pubsub.aclose()
+                await client.aclose()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # disable nginx proxy buffering
+        },
+    )
 
 
 @router.get("/compensations/{workflow_id}", summary="Pending Saga compensations")

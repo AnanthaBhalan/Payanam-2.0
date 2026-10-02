@@ -28,17 +28,20 @@ from app.solver.ray_dispatch import (  # noqa: E402
     wait_for_solve_result,
 )
 
-REDIS_URL = "redis://localhost:6389/0"  # the isolated .env profile
+# Two different Redis addresses, deliberately:
+#  * the Ray job runs INSIDE the cluster, so it writes via the compose DNS name
+#  * this test runs on the HOST, so it reads via the published port
+HOST_REDIS_URL = "redis://localhost:6389/0"
 
 
 async def _fleet_or_skip() -> FleetState:
     import redis.asyncio as aioredis
 
-    client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    client = aioredis.from_url(HOST_REDIS_URL, decode_responses=True)
     try:
         await client.ping()
     except Exception as exc:  # noqa: BLE001 - unreachable is a skip
-        pytest.skip(f"redis unreachable at {REDIS_URL}: {exc}")
+        pytest.skip(f"redis unreachable at {HOST_REDIS_URL}: {exc}")
     return FleetState(client)
 
 

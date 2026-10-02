@@ -59,6 +59,7 @@ with workflow.unsafe.imports_passed_through():
         book_train,
         cancel_train,
         publish_booking_event,
+        publish_itinerary_update,
         solve_itinerary,
     )
 
@@ -491,8 +492,32 @@ class ItineraryWorkflow:
             leg_id, target.get("origin"), target.get("destination"),
         )
         ctx.state = "FALLBACK"
+        # Tell the mobile client we are re-routing *before* acting on it.
+        await self._announce(
+            ctx,
+            status="re-routing",
+            reason=reason,
+            new_mode="CAB",
+            leg_id=leg_id,
+        )
         await self._fallback_to_cab(ctx, [target], reason)
         ctx.state = "FALLBACK_COMPLETED" if ctx.fallback_used else "FALLBACK_FAILED"
+
+    async def _announce(self, ctx: SagaContext, **event: Any) -> None:
+        """Push a state change to Redis Pub/Sub for SSE clients.
+
+        Best-effort: a broadcast failure must never abort the itinerary, so it
+        is logged and swallowed. The route itself still reports the truth.
+        """
+        payload = {
+            "workflow_id": workflow.info().workflow_id,
+            "itinerary_id": ctx.itinerary_id,
+            **event,
+        }
+        try:
+            await publish_itinerary_update(payload)
+        except Exception as exc:  # noqa: BLE001 - advisory only
+            workflow.logger.warning("SSE announce failed (non-fatal): %s", exc)
 
     @staticmethod
     def _first_degraded_leg(

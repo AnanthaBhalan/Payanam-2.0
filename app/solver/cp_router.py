@@ -23,7 +23,16 @@ import logging
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import ray
+try:  # pragma: no cover - depends on which image is running
+    import ray
+except ImportError:  # API/worker image: Ray Client is intentionally absent
+    # The API process never initialises Ray (Phase 6): solving is dispatched
+    # over the Ray Jobs REST API, and the cluster image runs this module with
+    # `ray` present. Here the decorator degrades to a plain function so
+    # `solve_local` -- which the /route endpoint uses for the initial plan --
+    # still imports and runs.
+    ray = None  # type: ignore[assignment]
+
 from ortools.sat.python import cp_model
 
 from ..models import (
@@ -376,7 +385,6 @@ class StochasticOrienteeringSolver:
 # --------------------------------------------------------------------------- #
 # Ray-distributed entrypoint
 # --------------------------------------------------------------------------- #
-@ray.remote
 def solve_routing_task(
     payload: Dict[str, object],
     time_limit_seconds: float = 5.0,
@@ -392,6 +400,14 @@ def solve_routing_task(
         time_limit_seconds=time_limit_seconds, num_workers=num_workers
     )
     return solver.solve(request).model_dump()
+
+
+# On the cluster image this becomes a Ray task; in the API image (no `ray`
+# package) it stays an ordinary callable, so importing this module for
+# `solve_local` never requires the Ray Client. The Ray image's job_entrypoint
+# is the only caller that uses ray.get() on it.
+if ray is not None:  # pragma: no branch
+    solve_routing_task = ray.remote(solve_routing_task)  # type: ignore[assignment]
 
 
 # Local (non-Ray) convenience wrapper for tests and CLI use.

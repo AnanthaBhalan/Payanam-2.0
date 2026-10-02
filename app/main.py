@@ -26,7 +26,6 @@ from .ingestion.stream import TrafficUpdateConsumer
 from .temporal_client import (
     connect_temporal,
     ensure_namespace,
-    shutdown_ray,
 )
 from .startup import retry_async
 from .workflows.activities import describe_activities
@@ -113,7 +112,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("shutting down %s", settings.app_name)
         await consumer.stop()
         await memgraph.close()
-        shutdown_ray()
 
 
 # --------------------------------------------------------------------------- #

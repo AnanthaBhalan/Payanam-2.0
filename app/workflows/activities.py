@@ -188,6 +188,39 @@ async def cancel_train(itinerary_id: str, train_id: str) -> Dict[str, Any]:
 
 
 @activity.defn
+async def publish_itinerary_update(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Publish a workflow state change to Redis Pub/Sub for SSE clients.
+
+    This is an *activity*, not inline workflow code, because the Temporal
+    sandbox forbids direct socket/Redis access from workflow code -- the same
+    constraint that forced the Ray Job REST handoff.
+    """
+    import json as _json
+
+    import redis.asyncio as aioredis
+    from temporalio.exceptions import ApplicationError
+
+    from ..config import get_settings
+
+    settings = get_settings()
+    workflow_id = str(payload.get("workflow_id") or "")
+    if not workflow_id:
+        raise ApplicationError("MISSING_WORKFLOW_ID", non_retryable=True)
+
+    event = {k: v for k, v in payload.items() if k != "workflow_id"}
+    channel = f"payanam:updates:{workflow_id}"
+
+    client = aioredis.from_url(settings.redis_url, decode_responses=True)
+    try:
+        receivers = await client.publish(channel, _json.dumps(event, default=str))
+    finally:
+        await client.aclose()
+
+    activity.logger.info("published to %s (%d subscriber(s))", channel, receivers)
+    return {"channel": channel, "receivers": int(receivers), "event": event}
+
+
+@activity.defn
 async def book_cab(
     itinerary_id: str,
     origin: str,

@@ -7,9 +7,8 @@ from __future__ import annotations
 
 import logging
 from datetime import timedelta
-from typing import Optional
+from typing import Dict, Optional
 
-import ray
 from temporalio.api.workflowservice.v1 import request_response_pb2 as _wr
 from temporalio.client import Client, WorkflowHandle
 from temporalio.service import RPCError, RPCStatusCode
@@ -20,6 +19,24 @@ from .workflows.itinerary import ItineraryWorkflow
 log = logging.getLogger("payanam.temporal")
 
 _CLIENT: Optional[Client] = None
+
+
+async def ray_health_probe(timeout: float = 5.0) -> Dict[str, object]:
+    """Report whether the Ray Job dashboard is reachable.
+
+    The API process no longer holds a Ray context -- solving is dispatched over
+    the Ray Jobs REST API from :mod:`app.solver.ray_dispatch`. So the health
+    signal is the dashboard answering, not a locally initialised runtime.
+    """
+    from .solver.ray_dispatch import dashboard_version
+
+    version = await dashboard_version()
+    if version is None:
+        return {"ready": False, "detail": "ray dashboard unreachable"}
+    return {
+        "ready": True,
+        "detail": f"dashboard {version.get('ray_version', '?')}",
+    }
 
 
 async def connect_temporal(settings: Optional[Settings] = None) -> Client:
@@ -132,86 +149,3 @@ async def start_itinerary_workflow(
     )
 
 
-# --------------------------------------------------------------------------- #
-# Ray
-# --------------------------------------------------------------------------- #
-_RAY_READY = False
-
-
-def init_ray(settings: Optional[Settings] = None) -> bool:
-    """Connect to the Ray cluster, falling back to a local embedded runtime.
-
-    Fail CLOSED: only an unreachable cluster justifies running the solver
-    in-process. A ``TypeError``/``AttributeError`` from a broken Ray build is a
-    bug and propagates.
-    """
-    global _RAY_READY
-    settings = settings or get_settings()
-    if _RAY_READY:
-        return True
-    try:
-        if not ray.is_initialized():
-            if settings.ray_address in ("local", "", None):
-                ray.init(
-                    num_cpus=settings.ray_num_cpus,
-                    include_dashboard=False,
-                    log_to_driver=False,
-                    ignore_reinit_error=True,
-                )
-            else:
-                ray.init(address=settings.ray_address, ignore_reinit_error=True)
-        _RAY_READY = True
-        # Ray 2.40's RuntimeContext has no get_node_address(); get_node_id() is
-        # the portable accessor.
-        try:
-            node_id = ray.get_runtime_context().get_node_id()
-        except Exception:  # noqa: BLE001 - logging must never break startup
-            node_id = "unknown"
-        log.info("ray ready (node=%s)", node_id)
-        return True
-    except (ConnectionError, OSError, ValueError) as exc:
-        log.error("ray init failed (%s); solver will run in-process", exc)
-        _RAY_READY = False
-        return False
-
-
-def ray_ready() -> bool:
-    return _RAY_READY and ray.is_initialized()
-
-
-@ray.remote
-def _ray_probe() -> bool:
-    """Trivial remote task used to prove the grid executes work.
-
-    A socket check only proves something is listening; submitting and reading
-    back a task proves the cluster actually schedules and returns results.
-    """
-    return True
-
-
-def ray_health_probe(timeout: float = 10.0) -> Dict[str, object]:
-    """Verify the compute grid by dispatching a real task.
-
-    Returns ``{"ready": bool, "detail": str}``. Never raises: a failure here is
-    a reported condition, not a crash.
-    """
-    if not ray_ready():
-        return {"ready": False, "detail": "ray not initialised"}
-    try:
-        result = ray.get(_ray_probe.remote(), timeout=timeout)
-        nodes = len(ray.nodes())
-        return {
-            "ready": bool(result),
-            "nodes": nodes,
-            "detail": "remote task executed" if result else "probe returned falsy",
-        }
-    except Exception as exc:  # noqa: BLE001 - reported, not raised
-        return {"ready": False, "detail": f"{type(exc).__name__}: {exc}"[:200]}
-
-
-def shutdown_ray() -> None:
-    global _RAY_READY
-    if ray.is_initialized():
-        ray.shutdown()
-    _RAY_READY = False
-    return client

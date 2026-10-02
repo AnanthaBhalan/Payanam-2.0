@@ -36,8 +36,21 @@ log = logging.getLogger("payanam.solver.jobs")
 DEFAULT_DASHBOARD = "http://ray-head:8265"
 RESULT_TTL_SECONDS = 600
 
-# Entrypoint executed by the cluster. The Ray image bakes the app to /opt/payanam.
-JOB_ENTRYPOINT = "python3 /opt/payanam/app/solver/job_entrypoint.py"
+# Where the app is baked into the Ray image (WORKDIR in Dockerfile.ray). The
+# Job Supervisor runs from an isolated workspace, so this must be absolute.
+RAY_APP_HOME = "/opt/payanam"
+
+# Redis as seen from INSIDE the compose network. The job runs on the cluster,
+# so it must not use the host-published port: settings.redis_url is host-facing
+# (redis://localhost:6389) and is unreachable from a Ray worker. Overridable
+# via RAY_JOB_REDIS_URL, but the default is the service DNS name.
+RAY_JOB_REDIS_URL = "redis://redis:6379/0"
+
+# Entrypoint executed by the cluster: absolute path + module import via
+# PYTHONPATH supplied through runtime_env.
+JOB_ENTRYPOINT = (
+    f"python3 {RAY_APP_HOME}/app/solver/job_entrypoint.py"
+)
 
 # Backoff schedule (seconds); the last value repeats.
 POLL_BACKOFF = (1.0, 2.0, 3.0, 5.0, 8.0, 10.0)
@@ -105,7 +118,13 @@ async def submit_solve_job(
 
     settings = get_settings()
     task_id = task_id or uuid.uuid4().hex
-    redis_url = redis_url or settings.redis_url
+    import os
+
+    # NOTE: the *job* runs on the cluster and needs the service DNS name; the
+    # API/worker keep the host-facing URL for their own Redis reads.
+    redis_url = redis_url or os.environ.get(
+        "RAY_JOB_REDIS_URL", RAY_JOB_REDIS_URL
+    )
 
     encoded = base64.b64encode(
         json.dumps(payload, default=str).encode("utf-8")
@@ -120,6 +139,17 @@ async def submit_solve_job(
         "entrypoint": entrypoint,
         "job_id": task_id,
         "metadata": {"task_id": task_id, "kind": "cp_sat_solve"},
+        # Ray Jobs run the entrypoint from a *fresh, isolated* workspace
+        # (…/session_*/workspace). Without this the supervisor cannot import
+        # `app.*` and dies instantly with FAILED and no logs. WORKDIR in
+        # Dockerfile.ray is /opt/payanam, so PYTHONPATH must point there.
+        "runtime_env": {
+            "env_vars": {
+                "PYTHONPATH": RAY_APP_HOME,
+                "REDIS_URL": redis_url,
+                "RAY_JOB_TASK_ID": task_id,
+            },
+        },
     }
 
     dashboard = dashboard_url(settings)

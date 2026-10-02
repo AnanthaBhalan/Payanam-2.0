@@ -79,22 +79,30 @@ def test_solver_entrypoint_is_remote_decorated() -> None:
     )
 
 
-def test_ray_dispatch_serialises_through_one_thread() -> None:
-    """The dispatch pool must have exactly one worker.
+def test_job_payload_declares_a_runtime_env() -> None:
+    """Ray Jobs run from an isolated workspace, so runtime_env is mandatory.
 
-    Ray Client is not thread-safe: more than one worker thread reintroduces the
-    cross-thread `InProgressSentinel` reference failure.
+    Without PYTHONPATH pointing at the baked-in app the supervisor cannot
+    import `app.*` and the job dies instantly with FAILED and no logs.
     """
-    from app.solver.ray_dispatch import _pool
+    import inspect
 
-    assert _pool()._max_workers == 1
+    from app.solver import ray_dispatch
+
+    src = inspect.getsource(ray_dispatch.submit_solve_job)
+    assert '"runtime_env"' in src
+    assert "RAY_APP_HOME" in src
+    # The job writes to Redis from *inside* the cluster.
+    assert ray_dispatch.RAY_JOB_REDIS_URL.startswith("redis://redis:")
+    # Entrypoint must be an absolute path, not a bare module name.
+    assert ray_dispatch.JOB_ENTRYPOINT.startswith("python3 /")
 
 
-def test_health_probe_reports_a_round_trip() -> None:
-    """ray_health_probe must execute a task, not merely report initialised."""
+async def test_health_probe_reports_a_round_trip() -> None:
+    """ray_health_probe reports on the Ray Jobs dashboard, not a local runtime."""
     from app.temporal_client import ray_health_probe
 
-    result = ray_health_probe(timeout=30.0)
+    result = await ray_health_probe()
     assert "ready" in result and "detail" in result
-    # With no cluster in-process this is False; that is a valid report.
+    # Offline is a valid report, not an exception.
     assert isinstance(result["ready"], bool)
