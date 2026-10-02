@@ -217,15 +217,40 @@ def set_fleet_state(state: Optional[FleetState]) -> None:
 
 
 def _build_client(settings: Settings) -> Any:
-    """Async Redis client, falling back to in-process fakeredis."""
+    """Build the Redis client.
+
+    Fail CLOSED. ``redis.asyncio.from_url`` is *lazy* -- it never opens a
+    socket -- so a dead server cannot be detected here and must not be
+    papered over. The only substitution this performs is ``redis-py`` not being
+    installed at all, which is a legitimate packaging state. A server that is
+    installed but unreachable surfaces at first use (or via
+    :func:`probe_fleet_state`) rather than being silently swapped for
+    fakeredis.
+    """
     try:
         import redis.asyncio as aioredis
-
-        log.info("fleet index using redis at %s", settings.redis_url)
-        return aioredis.from_url(settings.redis_url, decode_responses=False)
-    except Exception as exc:  # noqa: BLE001 - degrade, never block startup
-        log.warning("redis unavailable (%s); using in-process fakeredis", exc)
+    except ImportError as exc:  # pragma: no cover - packaging fallback
+        log.warning("redis-py unavailable (%s); using in-process fakeredis", exc)
         import fakeredis.aioredis as fakeaioredis
 
         return fakeaioredis.FakeRedis()
+
+    log.info("fleet index using redis at %s", settings.redis_url)
+    return aioredis.from_url(settings.redis_url, decode_responses=False)
+
+
+async def probe_fleet_state(state: Optional[FleetState] = None) -> bool:
+    """Ping the fleet index, returning False when it is genuinely unreachable.
+
+    Call this at startup to *report* fleet health without pretending the
+    application is fine. Errors are returned, not swallowed, so the caller can
+    decide policy; connection failures are the only ones reported as False.
+    """
+    state = state or get_fleet_state()
+    try:
+        await state.redis.ping()
+        return True
+    except (ConnectionError, OSError) as exc:
+        log.error("fleet index unreachable at %s: %s", state.settings.redis_url, exc)
+        return False
 

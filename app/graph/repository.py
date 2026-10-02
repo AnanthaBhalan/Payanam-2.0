@@ -6,15 +6,23 @@ Two interchangeable backends implement the same surface:
 * :class:`InMemoryRepository` -- an in-process graph with identical semantics,
   used by the integration test so the suite is runnable without Docker.
 
-``get_repository()`` prefers Memgraph and falls back to memory, so the same
-seeding and query code exercises either backend.
+``get_repository()`` prefers Memgraph and falls back to memory **only when the
+server is genuinely unreachable** -- see the fail-closed note on that function.
 """
 from __future__ import annotations
 
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from neo4j.exceptions import ServiceUnavailable
+
+from ..config import Settings, get_settings
 from ..models import NodeType, TimeWindow, TransitEdge, TransitNode
+
+# Imported at module level (not lazily inside the class) so the fail-closed
+# branch in get_repository() can be exercised by monkeypatching this name.
+# Safe: state.py imports from repository only inside function bodies.
+from .state import MemgraphClient
 
 log = logging.getLogger("payanam.graph")
 
@@ -379,16 +387,25 @@ def get_repository(
         _REPO = InMemoryRepository()
         return _REPO
 
+    # Fail CLOSED. Only an unreachable server may justify substituting the
+    # in-memory double. Any other failure -- bad Cypher (ClientError), a
+    # missing method (NotImplementedError), a bad response shape -- is a real
+    # bug and must propagate, or the test suite will happily pass against the
+    # double while production is broken.
     try:
-        repo = MemgraphRepository()
-        stats = repo.stats()
-        log.info(
-            "using memgraph repository (%s nodes, %s edges)", *stats.values()
-        )
-        _REPO = repo
-    except Exception as exc:  # noqa: BLE001 - degrade to memory
-        log.warning("memgraph unavailable (%s); using in-memory graph", exc)
+        client = MemgraphClient(get_settings())
+        client.connect()  # the only step allowed to raise "unavailable"
+    except (ServiceUnavailable, OSError) as exc:
+        log.warning("memgraph unreachable (%s); using in-memory graph", exc)
         _REPO = InMemoryRepository()
+        return _REPO
+
+    # From here on, construction and query errors surface loudly.
+    repo = MemgraphRepository(client=client)
+    log.info(
+        "using memgraph repository (%s)", repo.stats()
+    )
+    _REPO = repo
     return _REPO
 
 

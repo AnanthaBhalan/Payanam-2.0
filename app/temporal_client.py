@@ -156,7 +156,10 @@ def init_ray(settings: Optional[Settings] = None) -> bool:
         _RAY_READY = True
         log.info("ray ready at %s", ray.get_runtime_context().get_node_address())
         return True
-    except Exception as exc:  # noqa: BLE001 - degrade, do not crash the API
+    except (ConnectionError, OSError, ValueError) as exc:
+        # Fail CLOSED: only "cannot reach the cluster" justifies running the
+        # solver in-process. A TypeError/AttributeError from a broken Ray build
+        # is a real bug and must propagate.
         log.error("ray init failed (%s); solver will run in-process", exc)
         _RAY_READY = False
         return False
