@@ -215,7 +215,7 @@ async def test_concurrent_fallbacks_leave_fleet_consistent() -> None:
     assert len(targets) >= 3, "need >=3 concurrent fallbacks for this check"
 
     await asyncio.sleep(25.0)  # let the fallbacks settle
-    r = httpx.get(f"{API_BASE}/api/v1/fleet/stats", timeout=15.0)
+    r = httpx.get(f"{API_BASE}/api/v1/driver/fleet/stats", timeout=15.0)
     r.raise_for_status()
     stats = r.json()
     # Locks must be non-negative and bounded by what was ever registered; a

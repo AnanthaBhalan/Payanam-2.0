@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
+import redis.asyncio as aioredis
+
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
@@ -187,6 +189,37 @@ async def cancel_train(itinerary_id: str, train_id: str) -> Dict[str, Any]:
     return {"cancelled": True, "booking_id": booking_id, "refund_inr": refund}
 
 
+_REDIS_URL: Optional[str] = None
+
+
+def _redis_settings():
+    """Resolve the Redis URL once, outside the Temporal sandbox.
+
+    ``Settings`` reads ``os.environ``, which the sandbox forbids ("Cannot
+    access os.environ.items from inside a workflow"), so the URL is captured
+    at worker startup by :func:`prime_redis_url` and cached here. The activity
+    then never touches config at call time.
+    """
+    global _REDIS_URL
+    if _REDIS_URL is None:
+        from ..config import get_settings
+
+        _REDIS_URL = get_settings().redis_url
+    return _REDIS_URL
+
+
+def prime_redis_url(url: Optional[str] = None) -> str:
+    """Capture the Redis URL before any sandboxed workflow runs."""
+    global _REDIS_URL
+    if url:
+        _REDIS_URL = url
+    elif _REDIS_URL is None:
+        from ..config import get_settings
+
+        _REDIS_URL = get_settings().redis_url
+    return _REDIS_URL
+
+
 @activity.defn
 async def publish_itinerary_update(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Publish a workflow state change to Redis Pub/Sub for SSE clients.
@@ -194,25 +227,25 @@ async def publish_itinerary_update(payload: Dict[str, Any]) -> Dict[str, Any]:
     This is an *activity*, not inline workflow code, because the Temporal
     sandbox forbids direct socket/Redis access from workflow code -- the same
     constraint that forced the Ray Job REST handoff.
+
+    ``redis.asyncio`` is imported at module scope on purpose: when the call
+    runs inside the sandboxed workflow, a function-local import tries to touch
+    ``threading.RLock.__typing_substitutions`` and dies with "Cannot access
+    ...". Importing it here, in the passthrough'd activities module, keeps the
+    heavy module out of the restricted import machinery.
     """
-    import json as _json
-
-    import redis.asyncio as aioredis
-    from temporalio.exceptions import ApplicationError
-
-    from ..config import get_settings
-
-    settings = get_settings()
     workflow_id = str(payload.get("workflow_id") or "")
     if not workflow_id:
+        from temporalio.exceptions import ApplicationError
+
         raise ApplicationError("MISSING_WORKFLOW_ID", non_retryable=True)
 
     event = {k: v for k, v in payload.items() if k != "workflow_id"}
     channel = f"payanam:updates:{workflow_id}"
 
-    client = aioredis.from_url(settings.redis_url, decode_responses=True)
+    client = aioredis.from_url(_redis_settings(), decode_responses=True)
     try:
-        receivers = await client.publish(channel, _json.dumps(event, default=str))
+        receivers = await client.publish(channel, json.dumps(event, default=str))
     finally:
         await client.aclose()
 
@@ -431,23 +464,30 @@ async def load_transit_graph() -> Dict[str, Any]:
 @activity.defn
 async def publish_booking_event(event: Dict[str, Any]) -> Dict[str, Any]:
     """Emit a booking event onto Redpanda for downstream reconciliation."""
+    producer = None
     try:
-        from confluent_kafka import Producer
+        from aiokafka import AIOKafkaProducer
 
         from ..config import get_settings
 
         settings = get_settings()
-        producer = Producer({"bootstrap.servers": settings.kafka_brokers, "linger.ms": 50})
-        producer.produce(
+        producer = AIOKafkaProducer(bootstrap_servers=settings.kafka_brokers)
+        await producer.start()
+        await producer.send_and_wait(
             settings.kafka_topic_bookings,
             key=str(event.get("booking_id", "")).encode("utf-8"),
             value=json.dumps(event, default=str).encode("utf-8"),
         )
-        producer.flush(3.0)
         return {"published": True, "topic": settings.kafka_topic_bookings}
     except Exception as exc:  # noqa: BLE001 - telemetry must never fail a Saga
         log.warning("booking event publish skipped: %s", exc)
         return {"published": False, "reason": str(exc)}
+    finally:
+        if producer is not None:
+            try:
+                await producer.stop()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("producer stop failed: %s", exc)
 
 
 # --------------------------------------------------------------------------- #

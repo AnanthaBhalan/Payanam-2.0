@@ -1,4 +1,4 @@
-"""FastAPI application for Project payanam.
+﻿"""FastAPI application for Project payanam.
 
 Startup order (all best-effort -- the API stays up if a dependency is down):
 
@@ -22,13 +22,13 @@ from .api.driver_routes import router as driver_router
 from .api.routes import router as api_router
 from .config import get_settings
 from .graph.state import AsyncMemgraphClient
-from .ingestion.stream import TrafficUpdateConsumer
+from .ingestion.stream import TrafficUpdateConsumer, set_temporal_client
 from .temporal_client import (
     connect_temporal,
     ensure_namespace,
 )
 from .startup import retry_async
-from .workflows.activities import describe_activities
+from .workflows.activities import describe_activities, prime_redis_url
 
 settings = get_settings()
 logging.basicConfig(
@@ -54,6 +54,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         return client
 
     app.state.temporal = await retry_async("temporal", _temporal, settings=settings)
+
+    # Hand the client to the Kafka bridge explicitly. The consumer runs as its
+    # own task and resolves the sender lazily; without this it can race ahead
+    # of the first connect and drop every signal with
+    # "temporal client not initialised".
+    set_temporal_client(app.state.temporal)
+    # Same reason as the worker: the sandbox cannot read os.environ.
+    prime_redis_url(settings.redis_url)
 
     # --------------------------------------------------------------- ray
     app.state.ray_ready = False  # Phase 6: no Ray Client in this process
@@ -212,3 +220,4 @@ async def root() -> dict:
         "health": "/health",
         "route": "POST /api/v1/route",
     }
+

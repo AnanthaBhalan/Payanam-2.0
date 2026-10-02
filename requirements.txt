@@ -1,4 +1,4 @@
-# ---- Project Payanam --------------------------------------------------
+﻿# ---- Project Payanam --------------------------------------------------
 # Pinned to versions that ship Python 3.12/3.13 compatible wheels.
 # The API image is python:3.11-slim: Ray Client / Ray Jobs require the client
 # and cluster to agree on both the Ray version and the Python minor version.
@@ -19,8 +19,9 @@ temporalio==1.7.0
 # HTTP client for the Ray Job REST API
 httpx==0.28.1
 
-# Event bus
-confluent-kafka==2.6.1
+# Event bus. Phase 9: pure-Python aiokafka replaced confluent-kafka, whose
+# bundled librdkafka could not resolve the Redpanda service name in Docker.
+aiokafka>=0.10.0
 
 # Graph DB (the neo4j driver speaks Bolt, which Memgraph implements)
 neo4j==5.27.0
@@ -39,3 +40,4 @@ pytest-asyncio==0.25.0
 # NOTE: ray is intentionally NOT required by the API/worker image. Phase 6
 # removed Ray Client from the Temporal path; the cluster is driven purely over
 # the Ray Job REST API, and the Ray image is built from Dockerfile.ray.
+

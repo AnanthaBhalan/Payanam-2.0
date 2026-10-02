@@ -55,6 +55,16 @@ class Ledger:
     injected_at: Dict[str, float] = field(default_factory=dict)
     recovered_at: Dict[str, float] = field(default_factory=dict)
     streams_dropped: int = 0
+    # Workflow ids whose SSE stream has sent its 'ready' frame (i.e. the Redis
+    # subscription is registered). Chaos runs must not publish before this.
+    ready_streams: set = field(default_factory=set)
+    on_ready: Optional[Any] = field(default=None, repr=False)
+
+    async def mark_ready(self, workflow_id: str) -> None:
+        async with self.lock:
+            self.ready_streams.add(workflow_id)
+        if self.on_ready is not None:
+            self.on_ready(workflow_id)
 
     async def mark_sabotaged(self, workflow_id: str) -> None:
         async with self.lock:
@@ -153,6 +163,7 @@ async def observe_stream(
             async with aconnect_sse(client, "GET", url) as event_source:
                 async for sse in event_source.aiter_sse():
                     if sse.event == "ready":
+                        await ledger.mark_ready(workflow_id)
                         continue
                     if not sse.data or sse.data.startswith(":"):
                         continue
@@ -298,9 +309,29 @@ async def run_chaos(
         asyncio.create_task(observe_stream(wf, ledger, api_base, stop))
         for wf in workflow_ids
     ]
-    # Let the subscriptions register before publishing: Redis Pub/Sub silently
-    # drops an update with zero subscribers.
-    await asyncio.sleep(2.0)
+
+    # Wait until every SSE subscription is actually registered before sabotaging.
+    # Redis Pub/Sub silently drops an update that has zero subscribers, so a
+    # fixed sleep is not enough: under load the streams take a variable time to
+    # connect and the first disruptions would be lost. `_ready` fires once the
+    # 'ready' frame has been seen on every stream.
+    ready = asyncio.Event()
+
+    async def _await_ready() -> None:
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
+            log_msg = "SSE subscriptions not all ready; sabotaging anyway"
+            print(f"    {log_msg}")
+
+    ready_task = asyncio.create_task(_await_ready())
+    # `observe_stream` sets this via the ledger's ready callback.
+    ledger.on_ready = lambda wf: (
+        ready.set() if len(ledger.ready_streams) >= len(workflow_ids) else None
+    )
+    await ready_task
+
+    print(f"==> {len(workflow_ids)} SSE streams subscribed")
 
     print(f"==> sabotaging ~{sabotage_rate:.0%} of workflows via Kafka")
     try:

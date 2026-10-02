@@ -8,15 +8,22 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /srv/payanam
 
-# librdkafka is required by confluent-kafka; curl is used by the healthcheck.
+# curl is used by the healthcheck. Phase 9 dropped build-essential and
+# librdkafka-dev along with confluent-kafka: aiokafka is pure Python.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential librdkafka-dev curl \
+    && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+# The chaos harness needs httpx-sse, a dev dependency. Installing both keeps
+# `docker compose --profile chaos run` self-contained without a sidecar.
+COPY requirements-dev.txt .
+RUN pip install --upgrade pip \
+    && pip install -r requirements-dev.txt
 
 COPY app ./app
+# The chaos harness runs as a compose profile service (see docker-compose.yml).
+COPY scripts ./scripts
 
 EXPOSE 8000
 

@@ -15,7 +15,7 @@ from temporalio.worker import Worker
 from .config import get_settings
 from .startup import retry_async
 from .temporal_client import ensure_namespace
-from .workflows.activities import ACTIVITIES
+from .workflows.activities import ACTIVITIES, prime_redis_url
 from .workflows.itinerary import ItineraryWorkflow
 
 log = logging.getLogger("payanam.worker")
@@ -23,6 +23,9 @@ log = logging.getLogger("payanam.worker")
 
 async def main() -> None:  # pragma: no cover - long-running process
     settings = get_settings()
+    # Capture the Redis URL now: publish_itinerary_update runs inside the
+    # Temporal sandbox, which forbids reading os.environ.
+    prime_redis_url(settings.redis_url)
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",

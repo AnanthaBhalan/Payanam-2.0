@@ -18,7 +18,7 @@ import signal
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-from confluent_kafka import Consumer, KafkaError, KafkaException
+from aiokafka import AIOKafkaConsumer
 
 from ..config import Settings, get_settings
 
@@ -96,7 +96,12 @@ async def _temporal_signal_sender(
 
 
 class TrafficUpdateConsumer:
-    """Bridges ``confluent_kafka``'s blocking API onto an asyncio loop."""
+    """Bridges ``aiokafka``'s async consumer onto the app's asyncio loop.
+
+    Phase 9 replaced confluent-kafka: its bundled librdkafka could not resolve
+    the Redpanda service name inside Docker, so no disruption ever reached a
+    running workflow. aiokafka is pure Python and uses the standard resolver.
+    """
 
     def __init__(
         self,
@@ -115,35 +120,27 @@ class TrafficUpdateConsumer:
         self._stopping = asyncio.Event()
 
     # ------------------------------------------------------------- lifecycle
-    def _build_consumer(self) -> Consumer:
-        conf = {
-            "bootstrap.servers": self.settings.kafka_brokers,
-            "group.id": self.settings.kafka_consumer_group,
-            "auto.offset.reset": self.settings.kafka_auto_offset_reset,
-            "enable.auto.commit": False,  # at-least-once, explicit commits
-        # Docker DNS: librdkafka's built-in resolver intermittently fails on
-        # the compose service name and reports "Failed to resolve ... Missing
-        # close-", even though getaddrinfo resolves it fine. Forcing IPv4 and
-        # plaintext makes the lookup deterministic inside the network.
-        "broker.address.family": "v4",
-        "security.protocol": "PLAINTEXT",
-        "socket.timeout.ms": 5000,
-            "enable.partition.eof": True,
-            "session.timeout.ms": 10000,
-        }
-        consumer = Consumer(conf)
-        consumer.subscribe([self.settings.kafka_topic_traffic])
-        return consumer
+    def _build_consumer(self) -> "AIOKafkaConsumer":
+        """Construct the aiokafka consumer.
+
+        Phase 9: replaced confluent-kafka. Its bundled librdkafka failed to
+        resolve the Redpanda service name inside Docker ("Failed to resolve
+        'redpanda:9092' ... Missing close-") even though getaddrinfo resolved
+        it, so every transit_update was silently dropped. aiokafka is pure
+        Python and uses the standard resolver.
+        """
+        return AIOKafkaConsumer(
+            self.settings.kafka_topic_traffic,
+            bootstrap_servers=self.settings.kafka_brokers,
+            group_id=self.settings.kafka_consumer_group,
+            auto_offset_reset=self.settings.kafka_auto_offset_reset,
+            enable_auto_commit=False,  # at-least-once, explicit commits
+        )
 
     def start(self) -> Optional[asyncio.Task]:
         if self._task and not self._task.done():
             return self._task
-        try:
-            self._consumer = self._build_consumer()
-        except KafkaException as exc:
-            # Kafka must never take the API down -- degrade to in-process only.
-            log.error("kafka unavailable, live weights disabled: %s", exc)
-            return None
+        self._consumer = self._build_consumer()
         self._stopping.clear()
         self._task = asyncio.create_task(self._run(), name="traffic-update-consumer")
         log.info(
@@ -166,37 +163,52 @@ class TrafficUpdateConsumer:
             self._task = None
         if self._consumer is not None:
             try:
-                self._consumer.close()
+                await self._consumer.stop()
             except Exception as exc:  # noqa: BLE001
-                log.debug("consumer close failed: %s", exc)
+                log.debug("consumer stop failed: %s", exc)
             self._consumer = None
         log.info("kafka consumer stopped")
 
     # ------------------------------------------------------------------- run
     async def _run(self) -> None:
-        loop = asyncio.get_running_loop()
-        assert self._consumer is not None
+        """Consume `traffic_updates` and fan each message out.
+
+        aiokafka is natively async, so there is no thread offload: start(),
+        iterate, and commit all run on this loop. A broker that is not yet up
+        must not take the API down, so connect errors are retried in place.
+        """
+        consumer = self._consumer
+        assert consumer is not None
         while not self._stopping.is_set():
             try:
-                # poll() blocks, so push it onto a worker thread
-                msg = await loop.run_in_executor(None, self._consumer.poll, 1.0)
-            except KafkaException as exc:
-                log.error("kafka poll error: %s", exc)
-                await asyncio.sleep(2.0)
-                continue
+                await consumer.start()
+                break
+            except Exception as exc:  # noqa: BLE001 - broker may still be booting
+                log.warning("kafka not ready (%s); retrying in 3s", exc)
+                await asyncio.sleep(3.0)
 
-            if msg is None:
-                continue
-            if msg.error():
-                if msg.error().code() == KafkaError._PARTITION_EOF:
-                    continue
-                log.error("kafka message error: %s", msg.error())
-                continue
-
-            await self._handle(msg)
+        log.info("kafka consumer connected to %s", self.settings.kafka_brokers)
+        try:
+            async for msg in consumer:
+                if self._stopping.is_set():
+                    break
+                try:
+                    await self._handle(msg)
+                except Exception as exc:  # noqa: BLE001 - one bad event != dead loop
+                    log.warning("traffic event handling failed: %s", exc)
+                finally:
+                    # Explicit commit: at-least-once delivery.
+                    try:
+                        await consumer.commit()
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("commit failed: %s", exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.error("kafka consumer loop ended: %s", exc)
 
     async def _handle(self, msg) -> None:
-        raw = msg.value()
+        raw = msg.value
         try:
             event = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -231,7 +243,7 @@ class TrafficUpdateConsumer:
         value = self.registry.apply(edge_id, multiplier, mode)
         log.info(
             "traffic update edge=%s mode=%s -> %.3f (partition=%s offset=%s)",
-            edge_id, mode, value, msg.partition(), msg.offset(),
+            edge_id, mode, value, msg.partition, msg.offset,
         )
 
         if self._on_update is not None:

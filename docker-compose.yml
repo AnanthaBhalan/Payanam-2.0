@@ -44,6 +44,12 @@ services:
       - --reserve-memory=0M
       - --node-id=0
       - --check=false
+      # Without an explicit advertised address Redpanda advertises 127.0.0.1,
+      # so every client connects once and then is redirected to its own
+      # loopback. That is the real cause of the old librdkafka "Failed to
+      # resolve redpanda" error -- not a DNS problem at all.
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
     ports:
       - "${REDPANDA_KAFKA_HOST_PORT:-9092}:9092"   # PLAINTEXT brokers
       - "${REDPANDA_ADMIN_HOST_PORT:-9644}:9644"   # Admin API
@@ -149,6 +155,30 @@ services:
       TEMPORAL_CORS_ORIGINS: http://localhost:3000
     ports:
       - "${TEMPORAL_UI_HOST_PORT:-8233}:8080"   # Web UI
+
+  # ------------------------------------------------------------- chaos harness
+  # Runs INSIDE the compose network: Redpanda advertises itself as
+  # `redpanda:9092`, a name resolvable only on the Docker network. A host-side
+  # client can open localhost:9095 but then cannot follow the advertised
+  # metadata, so the harness must run in-network. Same image as the API.
+  chaos:
+    profiles: ["chaos"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: payanam-chaos
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      PAYANAM_API: http://api:8000
+      PAYANAM_KAFKA: redpanda:9092
+      PAYANAM_TOPIC: traffic_updates
+    command: >
+      python scripts/chaos_monkey.py
+      --tourists ${CHAOS_TOURISTS:-50}
+      --sabotage-rate ${CHAOS_SABOTAGE_RATE:-0.3}
+      --timeout ${CHAOS_TIMEOUT:-60}
 
   # ------------------------------------------------------ fleet geospatial
   redis:
