@@ -37,11 +37,16 @@ RETURN a.id AS origin,
        r.waitlisted AS waitlisted
 """
 
-# Enrichment (Phase 2): the subgraph of edges reachable from `origin` within
-# `depth` hops, carrying node metadata so the solver can apply windows.
+# Enrichment (Phase 2): the outgoing edge subgraph from `origin`.
+#
+# Deliberately SINGLE HOP. A variable-length pattern (`-[r:TRANSIT*1..d]->`)
+# makes ``r`` a *list* of relationships in Memgraph, so looking up
+# ``r.edge_id`` fails with "Only nodes, edges, maps ... have properties to be
+# looked up". Multi-hop expansion is therefore done client-side by
+# :meth:`MemgraphRepository.subgraph`, which yields byte-for-byte the same edge
+# set as the in-memory backend.
 SUBGRAPH_QUERY = """
-MATCH (a:City {id: $origin})-[r:TRANSIT*1..%d]->(b:City)
-WITH a, r, b
+MATCH (a:City {id: $origin})-[r:TRANSIT]->(b:City)
 RETURN a.id AS origin,
        b.id AS destination,
        r.edge_id AS edge_id,
@@ -54,8 +59,12 @@ RETURN a.id AS origin,
 
 
 def subgraph_query(depth: int = 1) -> str:
-    """Cypher for the outgoing edge subgraph within ``depth`` hops."""
-    return SUBGRAPH_QUERY % max(1, min(int(depth), 4))
+    """Cypher for one hop out of ``origin``.
+
+    ``depth`` is accepted for signature compatibility; the expansion itself
+    happens in :meth:`MemgraphRepository.subgraph`.
+    """
+    return SUBGRAPH_QUERY
 
 
 # --------------------------------------------------------------------------- #
@@ -258,6 +267,45 @@ class MemgraphRepository(TransitRepository):
         )
         return rows[0] if rows else None
 
+    def subgraph(self, origin: str, depth: int = 1) -> List[Dict[str, Any]]:
+        """Outgoing :TRANSIT edges within ``depth`` hops of ``origin``.
+
+        Expanded client-side with single-hop queries (see :data:`SUBGRAPH_QUERY`)
+        so the result matches :meth:`InMemoryRepository.subgraph` exactly.
+        """
+        frontier = [origin]
+        seen_nodes = {origin}
+        seen_edges: set = set()
+        out: List[Dict[str, Any]] = []
+        for _ in range(max(1, min(int(depth), 4))):
+            nxt: List[str] = []
+            for node in frontier:
+                for edge in self.client.run(SUBGRAPH_QUERY, origin=node):
+                    eid = edge["edge_id"]
+                    if eid in seen_edges:
+                        continue
+                    seen_edges.add(eid)
+                    out.append(edge)
+                    dest = edge["destination"]
+                    if dest not in seen_nodes:
+                        seen_nodes.add(dest)
+                        nxt.append(dest)
+            if not nxt:
+                break
+            frontier = nxt
+        return out
+
+    def subgraph_rows(self, edge_id: str) -> List[Dict[str, Any]]:
+        return self.client.run(
+            "MATCH ()-[r:TRANSIT {edge_id: $edge_id}]->() "
+            "RETURN r.edge_id AS edge_id",
+            edge_id=edge_id,
+        )
+
+    def stats(self) -> Dict[str, int]:
+        s = self.client.stats()
+        return {"nodes": int(s.get("cities", 0)), "edges": int(s.get("edges", 0))}
+
 # --------------------------------------------------------------------------- #
 # Row <-> domain mapping
 # --------------------------------------------------------------------------- #
@@ -348,26 +396,4 @@ def set_repository(repo: Optional[TransitRepository]) -> None:
     """Override the active repository (used by tests and the seeder)."""
     global _REPO
     _REPO = repo
-
-    def subgraph(self, origin: str, depth: int = 1) -> List[Dict[str, Any]]:
-        return self.client.run(subgraph_query(depth), origin=origin)
-
-    def subgraph_rows(self, edge_id: str) -> List[Dict[str, Any]]:
-        return self.client.run(
-            "MATCH ()-[r:TRANSIT {edge_id: $edge_id}]->() RETURN r.edge_id AS edge_id",
-            edge_id=edge_id,
-        )
-
-    def stats(self) -> Dict[str, int]:
-        s = self.client.stats()
-        return {"nodes": int(s.get("cities", 0)), "edges": int(s.get("edges", 0))}
-
-        return out
-
-    def stats(self) -> Dict[str, int]:
-        return {"nodes": len(self._nodes), "edges": len(self._edges)}
-
-    def clear(self) -> None:
-        self._nodes.clear()
-        self._edges.clear()
 

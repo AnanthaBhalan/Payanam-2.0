@@ -242,6 +242,24 @@ class MemgraphClient:
             )
         return nodes, edges
 
+    # ---------------------------------------------------------------- admin
+    def drop_transit_graph(self) -> None:
+        """Wipe every node and relationship (test/reseed hygiene)."""
+        self.execute("MATCH (n) DETACH DELETE n")
+
+    def stats(self) -> Dict[str, int]:
+        """Node and relationship counts.
+
+        Two separate queries rather than a chained ``WITH``: Memgraph rejects
+        the multi-MATCH form, and a zero-row graph must still report zeroes.
+        """
+        cities = self.run("MATCH (c:City) RETURN count(c) AS n")
+        edges = self.run("MATCH ()-[r:TRANSIT]->() RETURN count(r) AS n")
+        return {
+            "cities": int(cities[0]["n"]) if cities else 0,
+            "edges": int(edges[0]["n"]) if edges else 0,
+        }
+
 
 
 # --------------------------------------------------------------------------- #
@@ -359,20 +377,4 @@ async def retry_connect(
             await asyncio.sleep(delay)
     log.error("giving up on memgraph: %s", last)
     return False
-
-    # ---------------------------------------------------------------- admin
-    def drop_transit_graph(self) -> None:
-        self.execute("MATCH (n) DETACH DELETE n")
-
-    def stats(self) -> Dict[str, int]:
-        rows = self.run(
-            "MATCH (c:City) WITH count(c) AS cities "
-            "MATCH ()-[r:TRANSIT]->() RETURN cities, count(r) AS edges"
-        )
-        if not rows:
-            return {"cities": 0, "edges": 0}
-        return {
-            "cities": int(rows[0].get("cities") or 0),
-            "edges": int(rows[0].get("edges") or 0),
-        }
 
