@@ -11,8 +11,10 @@ pydantic-settings==2.7.0
 # helpers working while the compat shim also accepts the camelCase API.
 ortools>=9.11
 
-# Compute grid
-ray==2.40.0
+# Compute grid. `ray[client]` is required for the `ray://` address form used by
+# @ray.remote entrypoints; plain `ray` raises "Ray Client requires pip package
+# ray[client]" at dispatch time.
+ray[client]>=2.40
 
 # Orchestration
 temporalio==1.7.0

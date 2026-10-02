@@ -1,4 +1,4 @@
-"""Temporal client bootstrap shared by the API and the worker.
+﻿"""Temporal client bootstrap shared by the API and the worker.
 
 The namespace is created on demand so a fresh ``docker compose up`` works
 without a manual ``temporal operator namespace create``.
@@ -23,59 +23,67 @@ _CLIENT: Optional[Client] = None
 
 
 async def connect_temporal(settings: Optional[Settings] = None) -> Client:
-    """Connect to the Temporal frontend, retrying while the stack boots."""
+    """Connect to the Temporal frontend.
+
+    A single attempt: readiness retrying lives in :func:`app.startup.retry_async`,
+    which the lifespan and worker both call. Keeping the retry in one place
+    avoids two overlapping loops with different budgets.
+
+    ``wait_for_ready`` is deliberately NOT passed -- it is a parameter of
+    ``WorkflowHandle.start_workflow``, not of ``Client.connect``. Passing it
+    raised ``TypeError`` at startup, which is how this path stayed broken for
+    as long as the tests used the dev-server environment.
+    """
     global _CLIENT
     settings = settings or get_settings()
     if _CLIENT is not None:
         return _CLIENT
 
-    last: Optional[Exception] = None
-    for attempt in range(1, 11):
-        try:
-            client = await Client.connect(
-                settings.temporal_host,
-                namespace=settings.temporal_namespace,
-                wait_for_ready=False,
-            )
-            _CLIENT = client
-            log.info(
-                "temporal client connected to %s (ns=%s)",
-                settings.temporal_host,
-                settings.temporal_namespace,
-            )
-            return client
-        except (RPCError, OSError, RuntimeError) as exc:
-            last = exc
-            log.warning(
-                "temporal connect attempt %s/10 failed: %s", attempt, exc
-            )
-            import asyncio
-
-            await asyncio.sleep(2.0)
-    raise RuntimeError(f"could not connect to temporal at {settings.temporal_host}: {last}")
+    client = await Client.connect(
+        settings.temporal_host,
+        namespace=settings.temporal_namespace,
+    )
+    _CLIENT = client
+    log.info(
+        "temporal client connected to %s (ns=%s)",
+        settings.temporal_host,
+        settings.temporal_namespace,
+    )
+    return client
 
 
 def get_temporal_client() -> Client:
+    """Return the process-wide client, initialising it if necessary."""
+    global _CLIENT
     if _CLIENT is None:
         raise RuntimeError("temporal client not initialised; call connect_temporal()")
     return _CLIENT
 
+
 async def ensure_namespace(client: Client, namespace: str) -> bool:
-    """Create the namespace if the auto-setup server does not have it yet.
+    """Create the namespace if the server does not have it yet.
 
     Best-effort: a fresh ``docker compose up`` gets a working namespace without
-    a manual ``temporal operator namespace create``.
+    a manual ``temporal operator namespace create``. Only genuine RPC failures
+    are reported; nothing here silently downgrades the client.
     """
+    from temporalio.api.workflowservice.v1 import request_response_pb2 as _wr
+
     service = client.workflow_service
 
     try:
         await service.describe_namespace(
-            _wr.DescribeNamespaceRequest(id=namespace, namespace=namespace)
+            # Only `namespace` is set. `id` is the namespace *UUID*; passing the
+            # name there fails with "invalid UUID length" and the namespace is
+            # then never created.
+            _wr.DescribeNamespaceRequest(namespace=namespace)
         )
         log.info("temporal namespace '%s' already exists", namespace)
         return True
     except RPCError as exc:
-        if exc.status and exc.status.code == RPCStatusCode.NOT_FOUND:
+        # RPCError.status *is* the RPCStatusCode enum member; it has no .code
+        # attribute. Reading .code raised AttributeError and crashed startup.
+        if exc.status == RPCStatusCode.NOT_FOUND:
             log.info("temporal namespace '%s' not found; registering", namespace)
         else:
             log.warning("namespace describe failed: %s", exc)
@@ -85,7 +93,7 @@ async def ensure_namespace(client: Client, namespace: str) -> bool:
         await service.register_namespace(
             _wr.RegisterNamespaceRequest(
                 namespace=namespace,
-                description="payanam routing namespace",
+                description="Payanam routing namespace",
                 workflow_execution_retention_period=timedelta(days=3),
             )
         )
@@ -97,8 +105,6 @@ async def ensure_namespace(client: Client, namespace: str) -> bool:
             return True
         log.warning("namespace registration failed: %s", exc)
         return False
-
-
 
 
 async def start_itinerary_workflow(
@@ -135,8 +141,9 @@ _RAY_READY = False
 def init_ray(settings: Optional[Settings] = None) -> bool:
     """Connect to the Ray cluster, falling back to a local embedded runtime.
 
-    Never raises: routing degrades to an in-process CP-SAT solve if Ray is
-    unavailable, so the API stays up.
+    Fail CLOSED: only an unreachable cluster justifies running the solver
+    in-process. A ``TypeError``/``AttributeError`` from a broken Ray build is a
+    bug and propagates.
     """
     global _RAY_READY
     settings = settings or get_settings()
@@ -157,9 +164,6 @@ def init_ray(settings: Optional[Settings] = None) -> bool:
         log.info("ray ready at %s", ray.get_runtime_context().get_node_address())
         return True
     except (ConnectionError, OSError, ValueError) as exc:
-        # Fail CLOSED: only "cannot reach the cluster" justifies running the
-        # solver in-process. A TypeError/AttributeError from a broken Ray build
-        # is a real bug and must propagate.
         log.error("ray init failed (%s); solver will run in-process", exc)
         _RAY_READY = False
         return False
@@ -174,4 +178,4 @@ def shutdown_ray() -> None:
     if ray.is_initialized():
         ray.shutdown()
     _RAY_READY = False
-
+    return client

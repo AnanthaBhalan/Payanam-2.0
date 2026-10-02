@@ -69,6 +69,17 @@ class Settings(BaseSettings):
     solver_time_limit_seconds: float = Field(default=5.0)
     solver_num_workers: int = Field(default=8)
 
+    # ------------------------------------------------------ startup resilience
+    # Container ordering is not guaranteed: the API frequently boots before
+    # Memgraph/Temporal/Redis finish initialising. These bound the retry loop
+    # so the process waits instead of crash-looping.
+    startup_max_attempts: int = Field(default=30, ge=1, le=500)
+    startup_backoff_seconds: float = Field(default=2.0, gt=0.0, le=60.0)
+    # When false, an unreachable dependency is logged and startup continues
+    # (useful in tests); production should leave this on so a broken graph
+    # fails loudly instead of being papered over.
+    startup_fail_fast: bool = Field(default=True)
+
     @field_validator(
         "kafka_bootstrap_servers", "temporal_host", "memgraph_uri", "ray_address"
     )

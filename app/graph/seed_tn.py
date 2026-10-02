@@ -55,18 +55,29 @@ HUB_COORDS: Dict[str, Tuple[float, float]] = {
     RMM: (79.3134, 9.2881),    # Rameswaram
 }
 
+# Legacy demo codes from app.sample_data (Phase 1) map onto the canonical TN
+# hubs, so ``use_demo_data=True`` itineraries can also be geolocated.
+HUB_ALIASES: Dict[str, str] = {
+    "CHN": MAS,   # Chennai Central
+    "TRP": TPJ,   # Tiruchirappalli Rock Fort
+}
+
 
 def hub_coords(hub: str) -> Tuple[float, float]:
     """Resolve a hub code to ``(lon, lat)``.
 
     Accepts a bare code (``"MAS"``) or anything containing one, so callers can
-    pass ``"tn_vaigai_mas_mdu"`` or ``"MAS"`` interchangeably.
+    pass ``"tn_vaigai_mas_mdu"`` or ``"MAS"`` interchangeably. Legacy demo codes
+    resolve through :data:`HUB_ALIASES`.
+
     Raises :class:`KeyError` for an unknown hub -- an unroutable pickup is a
     terminal condition, not something to guess at.
     """
     if hub in HUB_COORDS:
         return HUB_COORDS[hub]
     upper = str(hub).upper()
+    if upper in HUB_ALIASES:
+        return HUB_COORDS[HUB_ALIASES[upper]]
     if upper in HUB_COORDS:
         return HUB_COORDS[upper]
     for code, coords in HUB_COORDS.items():

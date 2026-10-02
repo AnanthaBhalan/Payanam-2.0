@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .api.driver_routes import router as driver_router
 from .api.routes import router as api_router
 from .config import get_settings
-from .graph.state import AsyncMemgraphClient, retry_connect
+from .graph.state import AsyncMemgraphClient
 from .ingestion.stream import TrafficUpdateConsumer
 from .temporal_client import (
     connect_temporal,
@@ -30,6 +30,7 @@ from .temporal_client import (
     ray_ready,
     shutdown_ray,
 )
+from .startup import retry_async
 from .workflows.activities import describe_activities
 
 settings = get_settings()
@@ -48,13 +49,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log.info("starting %s (env=%s)", settings.app_name, settings.app_env)
 
     # ---------------------------------------------------------- temporal
-    try:
+    # Wait for the Temporal frontend: without it no workflow can start, and
+    # exiting here would just produce a Docker restart loop.
+    async def _temporal() -> Any:
         client = await connect_temporal(settings)
         await ensure_namespace(client, settings.temporal_namespace)
-        app.state.temporal = client
-    except Exception as exc:  # noqa: BLE001 - routes will 503, but /health works
-        log.error("temporal unavailable: %s", exc)
-        app.state.temporal = None
+        return client
+
+    app.state.temporal = await retry_async("temporal", _temporal, settings=settings)
 
     # --------------------------------------------------------------- ray
     app.state.ray_ready = init_ray(settings)
@@ -62,16 +64,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ---------------------------------------------------------- memgraph
     memgraph = AsyncMemgraphClient(settings)
     app.state.memgraph = memgraph
-    if await retry_connect(memgraph, attempts=3, delay=2.0):
+    connected = await retry_async(
+        "memgraph",
+        memgraph.connect,
+        settings=settings,
+        required=False,  # /health still reports degraded; don't hard-fail
+    )
+    if connected:
         try:
             seeded = await memgraph.seed_demo_state()
             log.info("memgraph seeded: %s", seeded)
         except Exception as exc:  # noqa: BLE001
             log.warning("memgraph seed skipped: %s", exc)
 
+    # ------------------------------------------------------------- redis
+    # The fleet index must be reachable before we accept dispatch requests.
+    from .fleet.state import get_fleet_state, probe_fleet_state
+
+    app.state.fleet_ok = await retry_async(
+        "redis",
+        probe_fleet_state,
+        settings=settings,
+        required=False,
+    )
+
     # ---------------------------------------------- phase 2: Tamil Nadu seed
-    # Idempotent: safe on every boot, and a no-op when Memgraph is absent
-    # (the repository layer falls back to the in-memory graph).
+    # Idempotent: safe on every boot. The repository layer fails closed, so a
+    # reachable-but-broken graph surfaces here rather than being papered over.
     try:
         from .graph.repository import get_repository
         from .graph.seed_tn import seed_tamil_nadu

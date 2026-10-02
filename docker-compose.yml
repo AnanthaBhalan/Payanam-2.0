@@ -10,17 +10,26 @@ services:
       # State-wide transit dataset, not just a toy graph.
       MEMGRAPH_GRAPHIST_MODE: --query-modules-enabled=true
     ports:
-      - "5432:5432"   # Bolt protocol  (neo4j driver)
-      - "3000:3000"   # Lab          (Dev UI)
-      - "9090:9090"   # Metrics
+      # NOTE: Bolt is 7687. The old mapping exposed 5432 (PostgreSQL's port)
+      # while labelling it "Bolt", so the API could never reach the graph.
+      - "${MEMGRAPH_BOLT_HOST_PORT:-7687}:7687"     # Bolt  (neo4j driver)
+      - "${MEMGRAPH_LAB_HOST_PORT:-3000}:3000"       # Lab   (Dev UI)
+      - "${MEMGRAPH_METRICS_HOST_PORT:-9090}:9090"   # Metrics
     volumes:
       - memgraph_data:/var/lib/memgraph
       - memgraph_log:/var/log/memgraph
     healthcheck:
-      test: ["CMD-SHELL", "echo 'RETURN 1;' | cypher-shell || exit 1"]
+      # cypher-shell is absent from memgraph/memgraph-platform, so the original
+      # probe could never pass. Probe the Bolt port directly -- but /dev/tcp is a
+      # *bash* extension and CMD-SHELL runs /bin/sh (dash), so bash is invoked
+      # explicitly.
+      test:
+        - CMD-SHELL
+        - "bash -c '(echo > /dev/tcp/127.0.0.1/7687)' >/dev/null 2>&1 || exit 1"
       interval: 10s
       timeout: 5s
       retries: 12
+      start_period: 20s
 
   # -------------------------------------------------------------- event bus
   redpanda:
@@ -36,15 +45,20 @@ services:
       - --node-id=0
       - --check=false
     ports:
-      - "9092:9092"   # PLAINTEXT brokers (host clients)
-      - "9644:9644"   # Admin API
+      - "${REDPANDA_KAFKA_HOST_PORT:-9092}:9092"   # PLAINTEXT brokers
+      - "${REDPANDA_ADMIN_HOST_PORT:-9644}:9644"   # Admin API
     volumes:
       - redpanda_data:/var/lib/redpanda/data
     healthcheck:
-      test: ["CMD-SHELL", "rpk cluster health --brokers=localhost:9092 | grep -q 'Healthy.*true'"]
+      # `rpk cluster health` is a cluster-level command and rejects --brokers;
+      # `rpk cluster info --brokers=...` is the per-endpoint probe that works.
+      test:
+        - CMD-SHELL
+        - "rpk cluster info --brokers=localhost:9092 >/dev/null 2>&1 || exit 1"
       interval: 10s
       timeout: 5s
       retries: 12
+      start_period: 20s
 
   # Create the topics the ingestion worker subscribes to.
   redpanda-init:
@@ -75,9 +89,12 @@ services:
       POSTGRES_USER: temporal
       POSTGRES_PWD: temporal
       POSTGRES_SEEDS: postgresql
-      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+      # DYNAMIC_CONFIG_FILE_PATH pointed at
+      # config/dynamicconfig/development-sql.yaml, which does not exist in this
+      # image ("Unable to create dynamic config client ... no such file").
+      # The image's built-in default is correct for local dev.
     ports:
-      - "7233:7233"   # gRPC
+      - "${TEMPORAL_GRPC_HOST_PORT:-7233}:7233"   # gRPC
     volumes:
       - temporal_data:/var/lib/postgresql/data
 
@@ -86,10 +103,15 @@ services:
     container_name: payanam-postgres
     environment:
       POSTGRES_USER: temporal
-      POSTGRES_PWD: temporal
+      # The image requires POSTGRES_PASSWORD to initialise; POSTGRES_PWD is
+      # what the Temporal *server* uses when connecting. Setting only
+      # POSTGRES_PWD makes the container exit(1) with "Database is
+      # uninitialized and superuser password is not specified".
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-temporal}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:-temporal}
       POSTGRES_DB: temporal
     ports:
-      - "5432:5432"
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - temporal_pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -126,7 +148,7 @@ services:
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_CORS_ORIGINS: http://localhost:3000
     ports:
-      - "8233:8080"   # Web UI  -> http://localhost:8233
+      - "${TEMPORAL_UI_HOST_PORT:-8233}:8080"   # Web UI
 
   # ------------------------------------------------------ fleet geospatial
   redis:
@@ -139,7 +161,7 @@ services:
       - --save
       - ""
     ports:
-      - "6379:6379"
+      - "${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -175,7 +197,7 @@ services:
       RAY_ADDRESS: ray://ray-head:6379
       RAY_NUM_CPUS: "2"
     ports:
-      - "8000:8000"
+      - "${API_HOST_PORT:-8000}:8000"
     # Seed the Tamil Nadu topology, run the worker + stream, then serve.
     command: >
       sh -c "python -m app.graph.seed_tn || true
@@ -196,15 +218,15 @@ services:
       /bin/bash -lc "ray start --head --port=6379 --dashboard-host=0.0.0.0
       --dashboard-port=8265 --num-cpus=2 --block"
     ports:
-      - "6379:6379"   # GCS (ray://)
-      - "8265:8265"   # Dashboard
-      - "10001:10001" # Job submission
+      - "${RAY_GCS_HOST_PORT:-6380}:6379"   # GCS (ray://)
+      - "${RAY_DASHBOARD_HOST_PORT:-8265}:8265"   # Dashboard
+      - "${RAY_JOB_HOST_PORT:-10001}:10001"   # Job submission
 
   ray-worker:
     image: rayproject/ray:2.40.0-py311
     container_name: payanam-ray-worker
     command: >
-      /bin/bash -lc "ray start --address=head:6379 --num-cpus=2 --block"
+      /bin/bash -lc "ray start --address=ray-head:6379 --num-cpus=2 --block"
     depends_on:
       - ray-head
 

@@ -77,6 +77,102 @@ uvicorn app.main:app --reload
 Interactive API docs: <http://localhost:8000/docs>
 Temporal UI: <http://localhost:8233>
 
+---
+
+## Running the full stack in isolation
+
+Host ports are a **global resource**. If another project already owns 3000,
+7687, 9092, 6379 or any other port, `docker compose up` fails with
+`Bind for 0.0.0.0:3000 failed: port is already allocated`.
+
+Every published port is parameterised with a default, so the fix is to copy
+`.env.example` to `.env` and shift **only the host side**:
+
+```bash
+cp .env.example .env
+```
+
+For a machine where another stack owns the defaults, use the isolated profile
+already documented in `.env.example`:
+
+```dotenv
+MEMGRAPH_BOLT_HOST_PORT=7690
+MEMGRAPH_LAB_HOST_PORT=3001
+MEMGRAPH_METRICS_HOST_PORT=9091
+REDIS_HOST_PORT=6389
+REDPANDA_KAFKA_HOST_PORT=9095
+REDPANDA_ADMIN_HOST_PORT=9645
+POSTGRES_HOST_PORT=5433
+TEMPORAL_GRPC_HOST_PORT=7234
+TEMPORAL_UI_HOST_PORT=8234
+API_HOST_PORT=8001
+RAY_GCS_HOST_PORT=6381
+RAY_DASHBOARD_HOST_PORT=8266
+RAY_JOB_HOST_PORT=10002
+```
+
+Then:
+
+```bash
+docker compose up -d
+docker compose ps          # wait until every service reports (healthy)
+```
+
+### You do NOT change any application setting
+
+Only the **host** side of a mapping moves; the **container** port is fixed and
+services inside the compose network keep using canonical ports and internal
+hostnames:
+
+| Purpose | In-network address (never changes) |
+|---|---|
+| Memgraph Bolt | `bolt://memgraph:7687` |
+| Memgraph Lab | `http://memgraph:3000` |
+| Redis | `redis://redis:6379/0` |
+| Redpanda | `redpanda:9092` |
+| Temporal | `temporal:7233` |
+| Ray GCS | `ray://ray-head:6379` |
+
+`docker-compose.yml` sets these, and every one is overridable by a standard
+environment variable — `MEMGRAPH_URI`, `REDIS_URL`, `KAFKA_BOOTSTRAP_SERVERS`,
+`TEMPORAL_HOST`, `RAY_ADDRESS`.
+
+### From the host, use your shifted ports
+
+```bash
+curl -s localhost:8001/health    # API
+open http://localhost:3001       # Memgraph Lab
+open http://localhost:8234       # Temporal UI
+open http://localhost:8266       # Ray dashboard
+```
+
+Running the app **outside** Docker against the shifted stack:
+
+```bash
+export MEMGRAPH_URI=bolt://localhost:7690
+export REDIS_URL=redis://localhost:6389/0
+export TEMPORAL_HOST=localhost:7234
+uvicorn app.main:app --reload
+```
+
+### Startup resilience
+
+The API and worker usually boot *before* Memgraph, Temporal and Redis finish
+initialising. Rather than crash-loop, `app/startup.py` retries the
+connection-establishment step, bounded by `STARTUP_MAX_ATTEMPTS` /
+`STARTUP_BACKOFF_SECONDS` (defaults 30 × 2 s).
+
+Retrying is deliberately narrow — only transport failures (`ConnectionError`,
+`OSError`, `ServiceUnavailable`, …). A `ClientError` from bad Cypher or an
+`AttributeError` from a missing method is a **defect** and propagates on the
+first attempt instead of being masked by retries. This mirrors the fail-closed
+policy the repository layer uses.
+
+On exhaustion the API logs loudly and reports `degraded` from `/health` rather
+than crash-looping.
+
+---
+
 ### Send a live disruption
 
 ```bash
