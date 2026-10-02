@@ -593,10 +593,27 @@ class ItineraryWorkflow:
             # The fallback itself failed -- the itinerary is simply unservable.
             workflow.logger.error("cab fallback failed: %s", exc)
             ctx.state = "FALLBACK_FAILED"
+            await self._announce(
+                ctx,
+                status="fallback_failed",
+                reason=str(exc)[:200],
+                leg_id=leg.get("leg_id", ""),
+            )
             return
         ctx.fallback_used = True
         ctx.booked.append(receipt)
         workflow.logger.info("fallback cab booked: %s", receipt.get("reference"))
+        # The RECOVERY signal: observers (SSE clients, the chaos harness) need a
+        # distinct event to tell "disrupted" apart from "actually re-routed".
+        await self._announce(
+            ctx,
+            status="fallback_secured",
+            mode="CAB",
+            leg_id=leg.get("leg_id", ""),
+            origin=leg.get("origin", ""),
+            destination=leg.get("destination", ""),
+            reference=receipt.get("reference", ""),
+        )
 
     async def _publish_events(self, ctx: SagaContext) -> None:
         for receipt in ctx.booked:

@@ -121,6 +121,13 @@ class TrafficUpdateConsumer:
             "group.id": self.settings.kafka_consumer_group,
             "auto.offset.reset": self.settings.kafka_auto_offset_reset,
             "enable.auto.commit": False,  # at-least-once, explicit commits
+        # Docker DNS: librdkafka's built-in resolver intermittently fails on
+        # the compose service name and reports "Failed to resolve ... Missing
+        # close-", even though getaddrinfo resolves it fine. Forcing IPv4 and
+        # plaintext makes the lookup deterministic inside the network.
+        "broker.address.family": "v4",
+        "security.protocol": "PLAINTEXT",
+        "socket.timeout.ms": 5000,
             "enable.partition.eof": True,
             "session.timeout.ms": 10000,
         }

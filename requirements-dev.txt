@@ -1,0 +1,14 @@
+﻿# Development / chaos-testing toolchain (not needed by the runtime images).
+-r requirements.txt
+
+# Kafka producer for scripts/chaos_monkey.py. The runtime consumer uses
+# confluent-kafka; aiokafka is the asyncio-native client the harness drives.
+aiokafka>=0.10.0
+
+# Server-Sent Events client. httpx_sse.aconnect_sse() streams
+# GET /api/v1/route/{id}/stream and parses the `data:` frames for us.
+httpx-sse>=0.4.0
+
+# Test/tooling
+pytest>=8.0
+pytest-asyncio>=0.24

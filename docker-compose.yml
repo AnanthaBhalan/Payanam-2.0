@@ -191,6 +191,11 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       KAFKA_TOPIC_TRAFFIC: traffic_updates
       REDIS_URL: redis://redis:6379/0
+      # Window before the FIRST booking during which a transit_update signal
+      # can still amend the plan. Without it the workflow books all legs in a
+      # few milliseconds and no disruption can ever land -- the Saga would be
+      # unreachable in practice. The chaos harness depends on this being > 0.
+      REPLAN_GRACE_SECONDS: ${REPLAN_GRACE_SECONDS:-10}
       TEMPORAL_HOST: temporal:7233
       TEMPORAL_NAMESPACE: payanam
       TEMPORAL_TASK_QUEUE: payanam-routing
