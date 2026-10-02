@@ -1,4 +1,4 @@
-"""Redis Pub/Sub -> SSE translation tests.
+﻿"""Redis Pub/Sub -> SSE translation tests.
 
 Fail-closed: every test skips cleanly when Redis is unreachable, so the suite
 still runs in environments with no containers.
@@ -48,7 +48,7 @@ async def _redis_or_skip():
 
 async def test_publish_activity_reaches_a_subscriber() -> None:
     """publish_itinerary_update lands on payanam:updates:{workflow_id}."""
-    from app.workflows.activities import publish_itinerary_update
+    from app.workflows.broadcast import publish_itinerary_update
 
     sub = await _redis_or_skip()
     pub = _client()
@@ -86,7 +86,7 @@ async def test_publish_requires_workflow_id() -> None:
     """A missing workflow_id is a terminal ApplicationError, not a silent no-op."""
     from temporalio.exceptions import ApplicationError
 
-    from app.workflows.activities import publish_itinerary_update
+    from app.workflows.broadcast import publish_itinerary_update
 
     await _redis_or_skip()
     with pytest.raises(ApplicationError):
@@ -175,3 +175,4 @@ async def test_sse_stream_terminates_cleanly_on_client_disconnect() -> None:
     first = await asyncio.wait_for(agen.__anext__(), timeout=5.0)
     assert first.startswith("event: ready")
     await agen.aclose()  # must not raise
+

@@ -1,4 +1,4 @@
-"""Temporal worker: executes ItinerarySaga and its activities.
+﻿"""Temporal worker: executes ItinerarySaga and its activities.
 
 Run standalone with::
 
@@ -15,7 +15,8 @@ from temporalio.worker import Worker
 from .config import get_settings
 from .startup import retry_async
 from .temporal_client import ensure_namespace
-from .workflows.activities import ACTIVITIES, prime_redis_url
+from .workflows.activities import ACTIVITIES
+from .workflows.broadcast import prime_redis_url, publish_itinerary_update
 from .workflows.itinerary import ItineraryWorkflow
 
 log = logging.getLogger("payanam.worker")
@@ -64,7 +65,7 @@ async def main() -> None:  # pragma: no cover - long-running process
         client,
         task_queue=settings.temporal_task_queue,
         workflows=[ItineraryWorkflow],
-        activities=list(ACTIVITIES),
+        activities=list(ACTIVITIES) + [publish_itinerary_update],
     )
     log.info(
         "worker polling '%s' for %d activities",
@@ -79,3 +80,5 @@ if __name__ == "__main__":  # pragma: no cover
         asyncio.run(main())
     except KeyboardInterrupt:
         log.info("worker interrupted")
+
+

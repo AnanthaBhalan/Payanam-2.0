@@ -28,7 +28,8 @@ from .temporal_client import (
     ensure_namespace,
 )
 from .startup import retry_async
-from .workflows.activities import describe_activities, prime_redis_url
+from .workflows.activities import describe_activities
+from .workflows.broadcast import prime_redis_url
 
 settings = get_settings()
 logging.basicConfig(
@@ -220,4 +221,5 @@ async def root() -> dict:
         "health": "/health",
         "route": "POST /api/v1/route",
     }
+
 

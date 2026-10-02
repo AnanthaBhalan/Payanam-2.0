@@ -1,4 +1,4 @@
-"""Temporal Workflow implementing the itinerary Saga.
+﻿"""Temporal Workflow implementing the itinerary Saga.
 
 Ordering contract (this is the whole point of the file):
 
@@ -59,7 +59,6 @@ with workflow.unsafe.imports_passed_through():
         book_train,
         cancel_train,
         publish_booking_event,
-        publish_itinerary_update,
         solve_itinerary,
     )
 
@@ -515,8 +514,21 @@ class ItineraryWorkflow:
             **event,
         }
         try:
-            await publish_itinerary_update(payload)
-        except Exception as exc:  # noqa: BLE001 - advisory only
+            # Invoked by REGISTERED STRING NAME, not by function reference.
+            # That keeps app.workflows.broadcast (which imports redis.asyncio)
+            # entirely outside the workflow sandbox, which would otherwise
+            # reject it with "Cannot access threading.RLock...".
+            await workflow.execute_activity(
+                "publish_itinerary_update",
+                args=[payload],
+                start_to_close_timeout=timedelta(seconds=5),
+                retry_policy=RetryPolicy(
+                    initial_interval=timedelta(seconds=1),
+                    backoff_coefficient=2.0,
+                    maximum_attempts=2,
+                ),
+            )
+        except (ActivityError, ApplicationError, FailureError) as exc:
             workflow.logger.warning("SSE announce failed (non-fatal): %s", exc)
 
     @staticmethod
@@ -643,4 +655,5 @@ class ItineraryWorkflow:
             "fallback_used": ctx.fallback_used,
             "solution": ctx.solution,
         }
+
 

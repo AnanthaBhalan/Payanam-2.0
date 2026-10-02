@@ -386,6 +386,14 @@ async def test_signal_above_threshold_does_not_trigger_unwind(harness) -> None:
     legs = headline_itinerary()
     async with harness() as h:
         handle = await h.start(legs, "payanam-e2e-2")
+        # Wait until run() has actually begun. A signal delivered before the
+        # workflow is running is dropped ("transit_update before run() started"),
+        # which would make this test assert on an absent update instead of on
+        # the threshold behaviour it exists to cover.
+        for _ in range(60):
+            if (await h.query()).get("state") != "IDLE":
+                break
+            await asyncio.sleep(0.05)
         await h.publish(
             {
                 "workflow_id": handle.id,

@@ -28,21 +28,18 @@ KAFKA_BOOTSTRAP = os.environ.get("PAYANAM_KAFKA", "localhost:9095")
 TOURISTS = 5
 SABOTAGE_RATE = 0.4  # -> exactly 2 of 5
 
-# The live tests below assert the FULL chain: Kafka -> confluent-kafka consumer
-# -> Temporal signal -> Saga unwind -> cab fallback -> SSE. That requires the
-# containerised librdkafka to actually resolve the broker. On this machine it
-# does not ("Failed to resolve 'redpanda:9092' ... Missing close-"), so every
-# transit_update is dropped and the assertion is untestable rather than broken.
-#
-# Set PAYANAM_CHAOS_LIVE=1 once the in-container Kafka bridge is fixed to run
-# them. The ledger tier above always runs and needs no gate.
-LIVE = os.environ.get("PAYANAM_CHAOS_LIVE", "0") == "1"
+# The live tests below assert the FULL chain: Kafka -> aiokafka -> Temporal
+# signal -> Saga unwind -> Redis GEO lock -> cab -> SSE. Phase 10 made this
+# work by moving the Redis broadcast out of the sandbox, so they now run
+# whenever the stack is up (and skip cleanly when it is not).
+# The live tests below assert the FULL chain: Kafka -> aiokafka -> Temporal
+# signal -> Saga unwind -> Redis GEO lock -> cab -> SSE. Phase 10 made this
+# work by moving the Redis broadcast out of the workflow sandbox, so they run
+# by default and still skip cleanly when the stack is not up.
+LIVE = os.environ.get("PAYANAM_CHAOS_LIVE", "1") == "1"
 requires_live = pytest.mark.skipif(
     not LIVE,
-    reason=(
-        "set PAYANAM_CHAOS_LIVE=1: the containerised Kafka consumer cannot "
-        "resolve redpanda, so no transit_update reaches the workflow"
-    ),
+    reason='set PAYANAM_CHAOS_LIVE=1 and start the stack to run the full chain',
 )
 
 
@@ -137,7 +134,11 @@ async def _kafka_bridge_live() -> bool:
             ).encode(),
         )
     except Exception as exc:  # noqa: BLE001 - unusable broker is a skip
-        pytest.skip(f"kafka producer unusable: {exc}")
+        # Redpanda advertises itself as `redpanda:9092`, a name only resolvable
+        # on the Docker network. A host-side client opens localhost:9095 fine
+        # but cannot follow the metadata, so it cannot drive the broker. The
+        # full chain is verified with `docker compose --profile chaos run`.
+        pytest.skip(f"kafka not usable from this host: {type(exc).__name__}: {exc}")
     finally:
         await producer.stop()
 
@@ -207,6 +208,7 @@ async def test_concurrent_fallbacks_leave_fleet_consistent() -> None:
     from chaos_monkey import inject_chaos, spawn_tourists
 
     _stack_up()
+    await _kafka_bridge_live()
 
     workflow_ids = await spawn_tourists(TOURISTS, api_base=API_BASE)
     targets = await inject_chaos(
@@ -232,3 +234,4 @@ async def test_recovery_latency_is_measured_from_injection() -> None:
     await ledger.observe("wf-t", {"status": "fallback_secured"})
     lat = ledger.latencies()
     assert len(lat) == 1 and lat[0] >= 0.05
+
