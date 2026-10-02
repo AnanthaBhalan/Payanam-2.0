@@ -1,4 +1,6 @@
-FROM python:3.12-slim
+# Python 3.11 is required: Ray Client refuses to connect when the client's
+# Python minor version differs from the cluster's (rayproject/ray:2.40.0-py311).
+FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

@@ -311,12 +311,22 @@ async def solve_itinerary(
     request_payload: Dict[str, Any],
     time_limit_seconds: float = 5.0,
 ) -> Dict[str, Any]:
-    """Run the CP-SAT model on the Ray cluster and return the solution dict."""
+    """Run the CP-SAT model on the Ray cluster and return the solution dict.
+
+    Ray Client (``ray://``) is **not thread-safe**: a reference created in one
+    context resolves to an ``InProgressSentinel`` in another, which surfaces as
+    ``AttributeError: 'InProgressSentinel' object has no attribute 'id'``.
+    Temporal dispatches activities from a different asyncio context than the one
+    that called ``ray.init()``, so every Ray call is funnelled through a
+    single-worker thread pool that owns the client exclusively.
+    """
     from ..solver.cp_router import solve_routing_task  # local import: heavy module
+    from ..solver.ray_dispatch import submit_solve
 
     activity.logger.info("solve_itinerary dispatching to ray")
-    ref = solve_routing_task.remote(request_payload, time_limit_seconds)
-    return await ref
+    return await submit_solve(
+        solve_routing_task, request_payload, time_limit_seconds
+    )
 
 
 @activity.defn

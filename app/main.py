@@ -27,6 +27,7 @@ from .temporal_client import (
     connect_temporal,
     ensure_namespace,
     init_ray,
+    ray_health_probe,
     ray_ready,
     shutdown_ray,
 )
@@ -170,6 +171,10 @@ async def health() -> dict:
     except Exception as exc:  # noqa: BLE001 - never fail health on fleet
         fleet_info = {"configured": False, "error": str(exc)}
 
+    # Dispatch a real remote task rather than reporting "initialised": only an
+    # executed round-trip proves the compute grid genuinely schedules work.
+    ray_status = ray_health_probe()
+
     return {
         "status": "ok" if (temporal_ok and memgraph_ok) else "degraded",
         "temporal": {
@@ -178,7 +183,9 @@ async def health() -> dict:
             "namespace": settings.temporal_namespace,
             "task_queue": settings.temporal_task_queue,
         },
-        "ray": {"ready": ray_ready(), "address": settings.ray_address},
+        # Dispatch a real task rather than reporting "initialised": only an
+        # executed round-trip proves the compute grid works.
+        "ray": {"address": settings.ray_address, **ray_status},
         "memgraph": {"connected": memgraph_ok, "uri": settings.memgraph_uri},
         "kafka": {
             "brokers": settings.kafka_brokers,

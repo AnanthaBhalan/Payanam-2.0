@@ -62,8 +62,15 @@ class Settings(BaseSettings):
     fleet_lock_ttl_seconds: int = Field(default=120, ge=1)
 
     # ------------------------------------------------------------------- ray
-    ray_address: str = Field(default="local")  # "local" in-process, else ray://host:6379
+    # Ray Client connects to the *client server* port (10001), not the GCS
+    # port (6379). Using 6379 here yields "ray client connection timeout".
+    ray_address: str = Field(default="ray://ray-head:10001")
+    # Ray Client requires the client and cluster to agree on BOTH the Ray
+    # version and the Python minor version; docker-compose pins
+    # rayproject/ray:2.40.0-py311, so requirements pins ray[client]==2.40.0 and
+    # the API image uses python:3.11-slim.
     ray_num_cpus: int = Field(default=2)
+    ray_connect_timeout: float = Field(default=30.0, gt=0.0, le=300.0)
 
     # ---------------------------------------------------------------- solver
     solver_time_limit_seconds: float = Field(default=5.0)

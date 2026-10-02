@@ -161,7 +161,13 @@ def init_ray(settings: Optional[Settings] = None) -> bool:
             else:
                 ray.init(address=settings.ray_address, ignore_reinit_error=True)
         _RAY_READY = True
-        log.info("ray ready at %s", ray.get_runtime_context().get_node_address())
+        # Ray 2.40's RuntimeContext has no get_node_address(); get_node_id() is
+        # the portable accessor.
+        try:
+            node_id = ray.get_runtime_context().get_node_id()
+        except Exception:  # noqa: BLE001 - logging must never break startup
+            node_id = "unknown"
+        log.info("ray ready (node=%s)", node_id)
         return True
     except (ConnectionError, OSError, ValueError) as exc:
         log.error("ray init failed (%s); solver will run in-process", exc)
@@ -171,6 +177,36 @@ def init_ray(settings: Optional[Settings] = None) -> bool:
 
 def ray_ready() -> bool:
     return _RAY_READY and ray.is_initialized()
+
+
+@ray.remote
+def _ray_probe() -> bool:
+    """Trivial remote task used to prove the grid executes work.
+
+    A socket check only proves something is listening; submitting and reading
+    back a task proves the cluster actually schedules and returns results.
+    """
+    return True
+
+
+def ray_health_probe(timeout: float = 10.0) -> Dict[str, object]:
+    """Verify the compute grid by dispatching a real task.
+
+    Returns ``{"ready": bool, "detail": str}``. Never raises: a failure here is
+    a reported condition, not a crash.
+    """
+    if not ray_ready():
+        return {"ready": False, "detail": "ray not initialised"}
+    try:
+        result = ray.get(_ray_probe.remote(), timeout=timeout)
+        nodes = len(ray.nodes())
+        return {
+            "ready": bool(result),
+            "nodes": nodes,
+            "detail": "remote task executed" if result else "probe returned falsy",
+        }
+    except Exception as exc:  # noqa: BLE001 - reported, not raised
+        return {"ready": False, "detail": f"{type(exc).__name__}: {exc}"[:200]}
 
 
 def shutdown_ray() -> None:

@@ -23,7 +23,7 @@ A running workflow is long-lived, so a plan made at T+0 can be invalidated at
 T+30s. `ItineraryWorkflow` accepts `transit_update` signals carrying a degraded
 confirmation probability; when a still-pending leg falls below
 `DEGRADED_THRESHOLD` (0.15) the workflow unwinds its Saga and books a
-substitute — the same compensation path a booking failure takes, entered from a
+substitute â€” the same compensation path a booking failure takes, entered from a
 different trigger.
 
 Signals never mutate history: the handler only queues the update, and the main
@@ -41,27 +41,27 @@ The demo circuit splits across both sessions rather than forcing a midday visit.
 Two Temporal workflows routinely reach the cab fallback simultaneously, so the
 claim is an optimistic transaction: `WATCH` the driver, verify status, `MULTI`
 the status flip + GEO-set move + `SET NX EX` lease, `EXEC`. A lost race is not
-an error — the caller simply tries the next-nearest cab.
+an error â€” the caller simply tries the next-nearest cab.
 
 ## Layout
 
 ```
 payanam/
-├── app/
-│   ├── solver/cp_router.py      # CP-SAT model, @ray.remote entrypoint
-│   ├── workflows/
-│   │   ├── itinerary.py         # Saga + transit_update signal + live query
-│   │   └── activities.py        # book_train / cancel_train / book_cab / book_bus
-│   ├── graph/
-│   │   ├── seed_tn.py           # Tamil Nadu topology + hub coordinates
-│   │   ├── repository.py        # Memgraph | in-memory backend
-│   │   └── state.py             # Cypher + subgraph routing-candidate queries
-│   ├── fleet/
-│   │   ├── state.py             # Redis GEO index, GEOADD / GEOSEARCH
-│   │   └── matcher.py           # bipartite matching + atomic driver locking
-│   ├── ingestion/stream.py      # Kafka -> Temporal signal bridge
-│   └── api/                     # routing + driver telemetry endpoints
-└── tests/                       # solver, saga, e2e, fleet matching
+â”œâ”€â”€ app/
+â”‚   â”œâ”€â”€ solver/cp_router.py      # CP-SAT model, @ray.remote entrypoint
+â”‚   â”œâ”€â”€ workflows/
+â”‚   â”‚   â”œâ”€â”€ itinerary.py         # Saga + transit_update signal + live query
+â”‚   â”‚   â””â”€â”€ activities.py        # book_train / cancel_train / book_cab / book_bus
+â”‚   â”œâ”€â”€ graph/
+â”‚   â”‚   â”œâ”€â”€ seed_tn.py           # Tamil Nadu topology + hub coordinates
+â”‚   â”‚   â”œâ”€â”€ repository.py        # Memgraph | in-memory backend
+â”‚   â”‚   â””â”€â”€ state.py             # Cypher + subgraph routing-candidate queries
+â”‚   â”œâ”€â”€ fleet/
+â”‚   â”‚   â”œâ”€â”€ state.py             # Redis GEO index, GEOADD / GEOSEARCH
+â”‚   â”‚   â””â”€â”€ matcher.py           # bipartite matching + atomic driver locking
+â”‚   â”œâ”€â”€ ingestion/stream.py      # Kafka -> Temporal signal bridge
+â”‚   â””â”€â”€ api/                     # routing + driver telemetry endpoints
+â””â”€â”€ tests/                       # solver, saga, e2e, fleet matching
 ```
 
 ## Quick start
@@ -108,7 +108,7 @@ TEMPORAL_UI_HOST_PORT=8234
 API_HOST_PORT=8001
 RAY_GCS_HOST_PORT=6381
 RAY_DASHBOARD_HOST_PORT=8266
-RAY_JOB_HOST_PORT=10002
+RAY_CLIENT_HOST_PORT=10002
 ```
 
 Then:
@@ -134,7 +134,7 @@ hostnames:
 | Ray GCS | `ray://ray-head:6379` |
 
 `docker-compose.yml` sets these, and every one is overridable by a standard
-environment variable — `MEMGRAPH_URI`, `REDIS_URL`, `KAFKA_BOOTSTRAP_SERVERS`,
+environment variable â€” `MEMGRAPH_URI`, `REDIS_URL`, `KAFKA_BOOTSTRAP_SERVERS`,
 `TEMPORAL_HOST`, `RAY_ADDRESS`.
 
 ### From the host, use your shifted ports
@@ -160,10 +160,10 @@ uvicorn app.main:app --reload
 The API and worker usually boot *before* Memgraph, Temporal and Redis finish
 initialising. Rather than crash-loop, `app/startup.py` retries the
 connection-establishment step, bounded by `STARTUP_MAX_ATTEMPTS` /
-`STARTUP_BACKOFF_SECONDS` (defaults 30 × 2 s).
+`STARTUP_BACKOFF_SECONDS` (defaults 30 Ã— 2 s).
 
-Retrying is deliberately narrow — only transport failures (`ConnectionError`,
-`OSError`, `ServiceUnavailable`, …). A `ClientError` from bad Cypher or an
+Retrying is deliberately narrow â€” only transport failures (`ConnectionError`,
+`OSError`, `ServiceUnavailable`, â€¦). A `ClientError` from bad Cypher or an
 `AttributeError` from a missing method is a **defect** and propagates on the
 first attempt instead of being masked by retries. This mirrors the fail-closed
 policy the repository layer uses.

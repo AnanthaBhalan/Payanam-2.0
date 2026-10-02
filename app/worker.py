@@ -29,6 +29,12 @@ async def main() -> None:  # pragma: no cover - long-running process
     )
     log.info("worker connecting to temporal at %s", settings.temporal_host)
 
+    # NOTE: Ray is deliberately NOT initialised here. Ray Client binds its
+    # session to the calling thread, so an init on this main thread leaves every
+    # submission from the activity dispatch thread holding an unresolved
+    # `InProgressSentinel`. `app.solver.ray_dispatch` initialises Ray inside the
+    # single thread that owns all submissions.
+
     # Wait for the Temporal frontend rather than exiting: in Compose the
     # worker usually wins the race against the server's first boot, and a bare
     # failure here becomes a restart loop.

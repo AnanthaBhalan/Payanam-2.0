@@ -194,7 +194,7 @@ services:
       TEMPORAL_HOST: temporal:7233
       TEMPORAL_NAMESPACE: payanam
       TEMPORAL_TASK_QUEUE: payanam-routing
-      RAY_ADDRESS: ray://ray-head:6379
+      RAY_ADDRESS: ${RAY_ADDRESS:-ray://ray-head:10001}
       RAY_NUM_CPUS: "2"
     ports:
       - "${API_HOST_PORT:-8000}:8000"
@@ -214,21 +214,39 @@ services:
   ray-head:
     image: rayproject/ray:2.40.0-py311
     container_name: payanam-ray-head
+    # --ray-client-server-port binds the Ray *Client* endpoint (10001). Ray
+    # Client talks to this port; 6379 is the GCS port used by workers to join.
+    # --node-ip-address advertises the compose DNS name so the client receives a
+    # routable address instead of the container's internal/loopback IP.
     command: >
-      /bin/bash -lc "ray start --head --port=6379 --dashboard-host=0.0.0.0
-      --dashboard-port=8265 --num-cpus=2 --block"
+      /bin/bash -lc "ray start --head --port=6379
+      --ray-client-server-port=10001
+      --node-ip-address=ray-head
+      --dashboard-host=0.0.0.0 --dashboard-port=8265
+      --num-cpus=2 --block"
     ports:
-      - "${RAY_GCS_HOST_PORT:-6380}:6379"   # GCS (ray://)
-      - "${RAY_DASHBOARD_HOST_PORT:-8265}:8265"   # Dashboard
-      - "${RAY_JOB_HOST_PORT:-10001}:10001"   # Job submission
+      - "${RAY_GCS_HOST_PORT:-6380}:6379"          # GCS (worker join)
+      - "${RAY_DASHBOARD_HOST_PORT:-8265}:8265"    # Dashboard
+      - "${RAY_CLIENT_HOST_PORT:-10001}:10001"     # Ray Client (ray://)
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "ray status >/dev/null 2>&1 || exit 1"
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
 
   ray-worker:
     image: rayproject/ray:2.40.0-py311
     container_name: payanam-ray-worker
+    # Joins via the GCS port (6379), advertising its own DNS name.
     command: >
-      /bin/bash -lc "ray start --address=ray-head:6379 --num-cpus=2 --block"
+      /bin/bash -lc "ray start --address=ray-head:6379
+      --node-ip-address=ray-worker --num-cpus=2 --block"
     depends_on:
-      - ray-head
+      ray-head:
+        condition: service_healthy
 
 volumes:
   memgraph_data:
