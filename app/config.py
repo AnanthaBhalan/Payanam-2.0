@@ -59,7 +59,8 @@ class Settings(BaseSettings):
     fleet_driver_prefix: str = Field(default="payanam:fleet:driver:")
     fleet_lock_prefix: str = Field(default="payanam:fleet:lock:")
     # Seconds a dispatch hold survives before it is considered abandoned.
-    fleet_lock_ttl_seconds: int = Field(default=120, ge=1)
+    # 4h matches a realistic trip lease; chaos/CI can shorten via env.
+    fleet_lock_ttl_seconds: int = Field(default=14400, ge=1)
 
     # ------------------------------------------------------------------- ray
     # Ray Client connects to the *client server* port (10001), not the GCS

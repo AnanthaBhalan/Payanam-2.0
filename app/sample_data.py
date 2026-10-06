@@ -6,6 +6,7 @@ inside one of the two sessions.
 """
 from __future__ import annotations
 
+import os
 from typing import List
 
 from .models import (
@@ -16,6 +17,18 @@ from .models import (
     TransitEdge,
     TransitNode,
 )
+
+
+def _test_mode() -> bool:
+    """``PAYANAM_TEST_MODE=1``: deterministic chaos baselines.
+
+    Mirrors ``app.graph.seed_tn._test_mode``: the chaos harness plans through
+    ``sample_request()``, so its edges must also be pinned to full
+    confirmation or the demo circuit reintroduces organic waitlist drops.
+    """
+    return os.getenv("PAYANAM_TEST_MODE", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def sample_nodes() -> List[TransitNode]:
@@ -55,7 +68,7 @@ def sample_nodes() -> List[TransitNode]:
 
 
 def sample_edges() -> List[TransitEdge]:
-    return [
+    edges: List[TransitEdge] = [
         TransitEdge(edge_id="e_chn_tan", origin="CHN", destination="TAN",
                     mode="TRAIN", travel_time_min=180, cost_inr=450.0,
                     probability=0.92, waitlisted=True),
@@ -84,6 +97,11 @@ def sample_edges() -> List[TransitEdge]:
                     mode="BUS", travel_time_min=360, cost_inr=900.0,
                     probability=0.90),
     ]
+    if _test_mode():
+        # PAYANAM_TEST_MODE: deterministic baseline -- only injected chaos may
+        # cause a drop (see app/graph/seed_tn.py).
+        edges = [e.model_copy(update={"probability": 1.0}) for e in edges]
+    return edges
 
 
 def sample_request() -> RoutingRequest:

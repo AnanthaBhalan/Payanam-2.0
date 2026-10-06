@@ -87,6 +87,13 @@ class FleetState:
         target = self.geo_available if dispatchable else self.geo_locked
         other = self.geo_locked if dispatchable else self.geo_available
 
+        if dispatchable:
+            # An explicit "I'm free" ping supersedes any stale lease left by
+            # a crashed workflow: without this, SET NX on the next dispatch
+            # would keep failing until the old TTL fires, silently poisoning
+            # an otherwise AVAILABLE driver.
+            await self.redis.delete(self.lock_key(driver_id))
+
         # Add to the target before removing from the other so a concurrent
         # GEOSEARCH sees the driver in exactly one set at all times.
         await self.redis.geoadd(target, (float(lon), float(lat), driver_id))
@@ -125,14 +132,77 @@ class FleetState:
         await self.redis.geoadd(target, (driver["lon"], driver["lat"], driver_id))
         await self.redis.zrem(other, driver_id)
 
-    async def release_driver(self, driver_id: str) -> bool:
-        """Return a driver to the available pool (drops any lease)."""
+    async def release_driver(
+        self,
+        driver_id: str,
+        drop_lon: Optional[float] = None,
+        drop_lat: Optional[float] = None,
+    ) -> bool:
+        """Return a driver to the available pool (drops any lease).
+
+        When drop coordinates are supplied the driver's position is updated
+        to the drop-off point, modelling the cab ending the trip there.
+        """
         await self.redis.delete(self.lock_key(driver_id))
         driver = await self.get_driver(driver_id)
         if driver is None:
             return False
-        await self.set_status(driver_id, AVAILABLE)
+        lon = float(drop_lon) if drop_lon is not None else float(driver.get("lon", 0.0))
+        lat = float(drop_lat) if drop_lat is not None else float(driver.get("lat", 0.0))
+        await self.redis.hset(
+            self.driver_key(driver_id),
+            mapping={
+                "status": AVAILABLE,
+                "lon": str(lon),
+                "lat": str(lat),
+                "assigned_to": "",
+                "dispatch_id": "",
+            },
+        )
+        await self.redis.geoadd(self.geo_available, (lon, lat, driver_id))
+        await self.redis.zrem(self.geo_locked, driver_id)
         return True
+
+    # Backwards-compatible alias used by matcher.release_cab.
+    async def release_driver_to(
+        self,
+        driver_id: str,
+        drop_lon: Optional[float] = None,
+        drop_lat: Optional[float] = None,
+    ) -> bool:
+        """Alias of :meth:`release_driver` with optional drop-off repositioning."""
+        return await self.release_driver(driver_id, drop_lon, drop_lat)
+
+    async def reclaim_expired_locks(self, limit: int = 500) -> int:
+        """Heal drivers whose lease key expired but whose status stayed ASSIGNED.
+
+        The lease key (``SET NX EX``) self-heals abandoned holds, but the
+        driver hash + GEO index are only updated on the explicit ``release``
+        path -- so a driver whose TTL fires without a release keeps sitting in
+        the ``locked`` set forever. This pass finds locked-set members with no
+        live lease key and restores them to AVAILABLE. Returns the count
+        reclaimed.
+        """
+        try:
+            members = await self.redis.zrange(self.geo_locked, 0, limit - 1)
+        except Exception:  # noqa: BLE001 - best-effort janitor
+            return 0
+        reclaimed = 0
+        for raw in members or []:
+            driver_id = _decode(raw)
+            try:
+                lease = await self.redis.get(self.lock_key(driver_id))
+            except Exception:  # noqa: BLE001 - treat unreadable as live (safe)
+                continue
+            if lease:
+                continue  # genuinely held
+            driver = await self.get_driver(driver_id)
+            if driver is None:
+                continue
+            if str(driver.get("status", "")).upper() in (ASSIGNED,):
+                await self.set_status(driver_id, AVAILABLE)
+                reclaimed += 1
+        return reclaimed
 
     # ------------------------------------------------------------------ reads
     async def find_nearest_available(

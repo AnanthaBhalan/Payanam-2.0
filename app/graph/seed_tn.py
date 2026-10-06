@@ -21,11 +21,26 @@ must trade reliability against travel time.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..models import NodeType, RoutingRequest, TimeWindow, TransitEdge, TransitNode
 
 log = logging.getLogger("payanam.graph")
+
+
+def _test_mode() -> bool:
+    """Deterministic chaos baselines: ``PAYANAM_TEST_MODE=1``.
+
+    Forces every edge's on-time confirmation probability to 1.0 so no leg can
+    drop organically at booking time -- the only disruptions a chaos run sees
+    are the ones ``scripts/chaos_monkey.py`` injects via ``traffic_updates``.
+    ``pytest`` does not set the flag, so the suite keeps exercising the real
+    probabilistic graph.
+    """
+    return os.getenv("PAYANAM_TEST_MODE", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 # --------------------------------------------------------------------------- #
 # Windows
@@ -134,7 +149,7 @@ def tn_nodes() -> List[TransitNode]:
 
 def tn_edges() -> List[TransitEdge]:
     """Directed :TRANSIT options across the network."""
-    return [
+    edges: List[TransitEdge] = [
         # --- Chennai -> Madurai: the headline reliability trade-off --------
         TransitEdge(
             edge_id="tn_vaigai_mas_mdu", origin=MAS, destination=MDU,
@@ -224,6 +239,11 @@ def tn_edges() -> List[TransitEdge]:
             probability=0.55, waitlisted=True,
         ),
     ]
+    if _test_mode():
+        # PAYANAM_TEST_MODE: pin every edge at full confirmation so the chaos
+        # baseline is deterministic -- no organic waitlist drops, ever.
+        edges = [e.model_copy(update={"probability": 1.0}) for e in edges]
+    return edges
 
 
 # --------------------------------------------------------------------------- #
@@ -263,7 +283,7 @@ def madurai_leg() -> Dict[str, object]:
         "destination": MDU,
         "travel_time_min": 540,
         "mode": "TRAIN",
-        "waitlist_probability": 0.45,
+        "waitlist_probability": 0.0 if _test_mode() else 0.45,
     }
 
 
@@ -364,7 +384,12 @@ def verify_seeded(repository: Optional[Any] = None) -> Dict[str, Any]:
     # The reliability trade-off the mandate calls out.
     vaigai = float(edges["tn_vaigai_mas_mdu"]["probability"])
     setc = float(edges["tn_setc_mas_mdu"]["probability"])
-    assert vaigai < setc, "Vaigai Express must be less reliable than SETC"
+    if _test_mode():
+        # Test mode deliberately flattens reliability to 1.0 everywhere for
+        # deterministic chaos baselines; the trade-off is a non-test concern.
+        assert vaigai == 1.0 and setc == 1.0, (vaigai, setc)
+    else:
+        assert vaigai < setc, "Vaigai Express must be less reliable than SETC"
 
     return {
         "backend": getattr(repo, "backend", "?"),
@@ -389,7 +414,11 @@ def main() -> int:  # pragma: no cover - CLI entrypoint
 
 
 if __name__ == "__main__":  # pragma: no cover
+    # NOTE: deliberately at the END of the module. An earlier placement ran
+    # main() before ``nodes_as_rows``/``edges_as_rows`` were defined, so the
+    # compose seed step crashed with a NameError on every boot.
     raise SystemExit(main())
+
 
 def nodes_as_rows() -> List[Dict[str, object]]:
     return [

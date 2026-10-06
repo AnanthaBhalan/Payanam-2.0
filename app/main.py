@@ -11,6 +11,7 @@ Shutdown reverses it: consumer stopped, Ray shut down, clients closed.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -94,6 +95,36 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         required=False,
     )
 
+    # ------------------------------------------ fleet lease self-healing (P11)
+    # Leases (``SET NX EX``) bound how long a crashed workflow can strand a
+    # driver; when a lease dies without an explicit ``release_cab``, the driver
+    # hash and GEO index still say ASSIGNED. This periodic pass restores them,
+    # so orphaned holds heal without manual Redis surgery.
+    async def _fleet_reclaim_loop(fleet: Any) -> None:
+        while True:
+            await asyncio.sleep(30.0)
+            try:
+                reclaimed = await fleet.reclaim_expired_locks()
+                if reclaimed:
+                    log.info("reclaimed %s expired fleet lease(s)", reclaimed)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - janitor must not die
+                log.warning("fleet reclaim pass failed: %s", exc)
+
+    app.state.fleet_reclaim_task = None
+    if app.state.fleet_ok:
+        try:
+            fleet = get_fleet_state()
+            reclaimed = await fleet.reclaim_expired_locks()
+            if reclaimed:
+                log.info("startup reclaim restored %s driver(s)", reclaimed)
+            app.state.fleet_reclaim_task = asyncio.create_task(
+                _fleet_reclaim_loop(fleet)
+            )
+        except Exception as exc:  # noqa: BLE001 - never block startup
+            log.warning("fleet reclaim loop not started: %s", exc)
+
     # ---------------------------------------------- phase 2: Tamil Nadu seed
     # Idempotent: safe on every boot. The repository layer fails closed, so a
     # reachable-but-broken graph surfaces here rather than being papered over.
@@ -119,6 +150,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         log.info("shutting down %s", settings.app_name)
+        task = getattr(app.state, "fleet_reclaim_task", None)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except BaseException:  # noqa: BLE001 - shutdown must not raise
+                pass
         await consumer.stop()
         await memgraph.close()
 

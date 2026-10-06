@@ -174,6 +174,8 @@ services:
       PAYANAM_API: http://api:8000
       PAYANAM_KAFKA: redpanda:9092
       PAYANAM_TOPIC: traffic_updates
+      # Deterministic fleet baseline the run must return to intact.
+      PAYANAM_FLEET_SIZE: "${PAYANAM_FLEET_SIZE:-60}"
     command: >
       python scripts/chaos_monkey.py
       --tourists ${CHAOS_TOURISTS:-50}
@@ -221,6 +223,11 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       KAFKA_TOPIC_TRAFFIC: traffic_updates
       REDIS_URL: redis://redis:6379/0
+      # Phase 11: deterministic chaos baselines. Pins every graph edge's
+      # confirmation probability to 1.0 so only injected sabotage causes
+      # drops (see app/graph/seed_tn.py). Set PAYANAM_TEST_MODE=0 for
+      # organic-risk demos.
+      PAYANAM_TEST_MODE: "${PAYANAM_TEST_MODE:-1}"
       # Window before the FIRST booking during which a transit_update signal
       # can still amend the plan. Without it the workflow books all legs in a
       # few milliseconds and no disruption can ever land -- the Saga would be
@@ -233,11 +240,16 @@ services:
       RAY_NUM_CPUS: "2"
     ports:
       - "${API_HOST_PORT:-8000}:8000"
-    # Seed the Tamil Nadu topology, run the worker + stream, then serve.
+    # Seed the TN topology, run the worker, then serve.
+    #
+    # NOTE: exactly ONE Kafka consumer runs -- the FastAPI lifespan's. An
+    # earlier standalone `python -m app.ingestion.stream` shared the consumer
+    # group but had no Temporal client, so every traffic_update it received
+    # was dropped with "temporal client not initialised" (Phase 11: sabotaged
+    # workflows whose signal never reached the workflow broke parity).
     command: >
       sh -c "python -m app.graph.seed_tn || true
              python -m app.worker &
-             python -m app.ingestion.stream &
              uvicorn app.main:app --host 0.0.0.0 --port 8000"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]

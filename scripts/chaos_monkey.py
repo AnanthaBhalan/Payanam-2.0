@@ -119,14 +119,16 @@ class Ledger:
 async def spawn_tourists(
     count: int = 50,
     api_base: str = API_BASE,
-    waitlist_probability: float = 0.85,
+    waitlist_probability: float = 0.0,
 ) -> List[str]:
     """Fire `count` concurrent POST /api/v1/route, return the workflow ids.
 
     The demo payload is used so every tourist plans the same Tamil Nadu circuit
     and therefore shares leg ids -- which is what lets the saboteur degrade a
-    *known* leg. A high waitlist_probability keeps legs pending so a disruption
-    still has something to unwind.
+    *known* leg. ``waitlist_probability`` stays 0.0: each leg already carries an
+    explicit drop risk derived from its edge's confirmation probability, and
+    under ``PAYANAM_TEST_MODE=1`` that risk is 0.0 everywhere. The ONLY drops
+    in a chaos run must be the injected ones, or Sabotaged != Disrupted.
     """
     body = {"use_demo_data": True, "waitlist_probability": waitlist_probability}
     timeout = httpx.Timeout(120.0, connect=15.0)
@@ -144,6 +146,88 @@ async def spawn_tourists(
         results = await asyncio.gather(*[one() for _ in range(count)])
 
     return [wf for wf in results if wf]
+
+
+# --------------------------------------------------------------------------- #
+# 1b. Fleet baseline (Phase 11: deterministic, leak-free capacity)
+# --------------------------------------------------------------------------- #
+FLEET_SIZE = int(os.environ.get("PAYANAM_FLEET_SIZE", "60"))
+
+# Pinned hub coordinates (see app/graph/seed_tn.py HUB_COORDS): cabs are
+# seeded around the five Tamil Nadu hubs so every fallback leg has supply.
+HUB_COORDS: Dict[str, tuple] = {
+    "MAS": (80.2707, 13.0827),
+    "TPJ": (78.7047, 10.7905),
+    "MDU": (78.1193, 9.9252),
+    "KMU": (79.5639, 10.9500),
+    "RMM": (79.3134, 9.2881),
+}
+
+
+def fleet_layout(count: int = FLEET_SIZE, seed: int = 7) -> List[Dict[str, Any]]:
+    """Deterministic driver placement: `count` cabs spread over the hubs.
+
+    Stable across runs (fixed RNG seed) so the baseline available-count is
+    comparable run to run -- the whole point of the Phase 11 determinism
+    mandate.
+    """
+    rng = random.Random(seed)
+    hubs = list(HUB_COORDS.items())
+    drivers: List[Dict[str, Any]] = []
+    for i in range(count):
+        _hub, (lon, lat) = hubs[i % len(hubs)]
+        drivers.append(
+            {
+                "driver_id": f"drv-{i:03d}",
+                "lon": round(lon + rng.uniform(-0.05, 0.05), 5),
+                "lat": round(lat + rng.uniform(-0.05, 0.05), 5),
+                "status": "AVAILABLE",
+            }
+        )
+    return drivers
+
+
+async def fleet_baseline(
+    api_base: str = API_BASE, count: int = FLEET_SIZE
+) -> Dict[str, int]:
+    """(Re)register the deterministic fleet and return its occupancy.
+
+    Re-pinging every driver as AVAILABLE also clears stale leases left by a
+    previous run (the API deletes the lease key on a dispatchable ping), so
+    each chaos run starts from a known-clean baseline.
+    """
+    body = {"drivers": fleet_layout(count)}
+    timeout = httpx.Timeout(60.0, connect=10.0)
+    async with httpx.AsyncClient(base_url=api_base, timeout=timeout) as client:
+        r = await client.post("/api/v1/driver/locations", json=body)
+        r.raise_for_status()
+        s = await client.get("/api/v1/driver/fleet/stats")
+        s.raise_for_status()
+        return s.json()
+
+
+async def fleet_stats(api_base: str = API_BASE) -> Dict[str, int]:
+    async with httpx.AsyncClient(
+        base_url=api_base, timeout=httpx.Timeout(15.0)
+    ) as client:
+        r = await client.get("/api/v1/driver/fleet/stats")
+        r.raise_for_status()
+        return r.json()
+
+
+async def wait_for_fleet_release(
+    api_base: str = API_BASE, timeout: float = 45.0
+) -> Dict[str, int]:
+    """Poll until every fallback cab has been released back to the pool."""
+    deadline = time.monotonic() + timeout
+    stats = await fleet_stats(api_base)
+    while time.monotonic() < deadline and int(stats.get("locked", 0)) > 0:
+        await asyncio.sleep(1.0)
+        try:
+            stats = await fleet_stats(api_base)
+        except Exception:  # noqa: BLE001 - transient API blip; keep polling
+            pass
+    return stats
 
 
 # --------------------------------------------------------------------------- #
@@ -210,14 +294,6 @@ async def inject_chaos(
     rng = random.Random(seed)
     k = max(1, int(round(len(workflow_ids) * sabotage_rate)))
     targets = rng.sample(list(workflow_ids), k)
-
-    if leg_id is None:
-        legs = await _first_leg_per_workflow(targets, api_base=API_BASE)
-        targets = [wf for wf in targets if legs.get(wf)]
-        leg_ids = [legs[wf] for wf in targets]
-    else:
-        leg_ids = [leg_id] * len(targets)
-
     if not targets:
         return []
 
@@ -225,20 +301,50 @@ async def inject_chaos(
 
     producer = AIOKafkaProducer(bootstrap_servers=bootstrap)
     await producer.start()
+    sent: List[str] = []
+
+    async def resolve_and_signal(wf: str) -> Optional[str]:
+        """Resolve this workflow's target leg, then signal it IMMEDIATELY.
+
+        Streaming matters: the earlier all-then-send design resolved every
+        workflow's plan BEFORE sending any signal, so the slowest solver (up
+        to 45s) delayed the sends past the fast workflows' replan-grace
+        window -- they finished every booking and the signal then bounced
+        with "workflow execution already completed": sabotaged but never
+        disrupted. Signalling the instant a plan exists lands the update
+        mid-grace for every workflow, which is what makes
+        Sabotaged == Disrupted == Recovered achievable.
+        """
+        if leg_id:
+            resolved = leg_id
+        else:
+            legs = await _first_leg_per_workflow(
+                [wf], api_base=API_BASE, timeout=75.0
+            )
+            resolved = legs.get(wf)
+        if not resolved:
+            return None  # no plan discovered: never sabotaged, parity safe
+        payload = {
+            "workflow_id": wf,
+            "leg_id": resolved,
+            "p_confirm": SABOTAGE_P_CONFIRM,
+            "delay_minutes": 0,
+        }
+        await producer.send_and_wait(topic, json.dumps(payload).encode("utf-8"))
+        if ledger is not None:
+            await ledger.mark_sabotaged(wf)
+        return wf
+
     try:
-        for wf, leg in zip(targets, leg_ids):
-            payload = {
-                "workflow_id": wf,
-                "leg_id": leg,
-                "p_confirm": SABOTAGE_P_CONFIRM,
-                "delay_minutes": 0,
-            }
-            await producer.send_and_wait(topic, json.dumps(payload).encode("utf-8"))
-            if ledger is not None:
-                await ledger.mark_sabotaged(wf)
+        for coro in asyncio.as_completed(
+            [resolve_and_signal(wf) for wf in targets]
+        ):
+            wf = await coro
+            if wf:
+                sent.append(wf)
     finally:
         await producer.stop()
-    return targets
+    return sent
 
 
 async def _first_leg_per_workflow(
@@ -295,10 +401,18 @@ async def run_chaos(
     api_base: str = API_BASE,
     timeout: float = 60.0,
     seed: Optional[int] = None,
+    fleet_size: int = FLEET_SIZE,
 ) -> Dict[str, Any]:
     ledger = Ledger()
     stop = asyncio.Event()
     started = time.monotonic()
+
+    print(f"==> preparing fleet baseline ({fleet_size} drivers)")
+    baseline = await fleet_baseline(api_base, fleet_size)
+    print(
+        f"    available={baseline.get('available')} "
+        f"locked={baseline.get('locked')}"
+    )
 
     print(f"==> spawning {tourists} tourists against {api_base}")
     workflow_ids = await spawn_tourists(tourists, api_base=api_base)
@@ -352,9 +466,22 @@ async def run_chaos(
         task.cancel()
     await asyncio.gather(*observers, return_exceptions=True)
 
+    # Phase 11: the fleet must come back whole. release_cab runs inside the
+    # workflow just before it completes, so a short poll is enough; the lease
+    # TTL + the API's reclaim pass are the hard backstop if a release is lost.
+    print("==> waiting for fallback cabs to be released back to the fleet")
+    final = await wait_for_fleet_release(api_base, timeout=45.0)
+
     report = await ledger.report()
     report["elapsed_s"] = round(time.monotonic() - started, 2)
     report["timed_out"] = bool(ledger.pending())
+    report["fleet_available_before"] = int(baseline.get("available", 0))
+    report["fleet_available_after"] = int(final.get("available", 0))
+    report["fleet_locked_after"] = int(final.get("locked", 0))
+    report["fleet_restored"] = (
+        int(final.get("available", 0)) == int(baseline.get("available", 0))
+        and int(final.get("locked", 0)) == 0
+    )
     return report
 
 
@@ -375,6 +502,19 @@ def _print_report(report: Dict[str, Any]) -> None:
     print(f"  {'Avg Recovery Latency (s)':<34} {lat if lat is not None else 'n/a'}")
     print(f"  {'Max Recovery Latency (s)':<34} {report.get('max_recovery_latency_s')}")
     print(f"  {'Elapsed (s)':<34} {report.get('elapsed_s')}")
+    print(
+        f"  {'Fleet available before':<34} "
+        f"{report.get('fleet_available_before')}"
+    )
+    print(
+        f"  {'Fleet available after':<34} "
+        f"{report.get('fleet_available_after')}"
+    )
+    print(
+        f"  {'Fleet locked after (must be 0)':<34} "
+        f"{report.get('fleet_locked_after')}"
+    )
+    print(f"  {'Fleet fully restored':<34} {report.get('fleet_restored')}")
     if report.get("timed_out"):
         print("  !! timed out with workflows still unrecovered")
     print("=" * 58)
@@ -388,6 +528,7 @@ def main() -> int:
     parser.add_argument("--kafka", default=KAFKA_BOOTSTRAP)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--fleet-size", type=int, default=FLEET_SIZE)
     args = parser.parse_args()
 
     report = asyncio.run(
@@ -397,11 +538,42 @@ def main() -> int:
             api_base=args.api,
             timeout=args.timeout,
             seed=args.seed,
+            fleet_size=args.fleet_size,
         )
     )
     _print_report(report)
-    # Exit 0 unless nothing was sabotaged, i.e. the run proved nothing.
-    return 0 if report["sabotaged_trips"] else 1
+
+    # Exit 0 only on a perfect, leak-free run: every sabotaged workflow must
+    # show exactly one disruption and exactly one recovery, and the fleet must
+    # be back at its baseline with an empty lock ledger.
+    sabotaged = int(report.get("sabotaged_trips") or 0)
+    if sabotaged == 0:
+        print("FAIL: nothing was sabotaged -- the run proved nothing")
+        return 1
+    parity = (
+        int(report.get("disrupted_trips") or 0) == sabotaged
+        and int(report.get("recovered_trips") or 0) == sabotaged
+        and int(report.get("failed_trips") or 0) == 0
+    )
+    if not parity:
+        print(
+            "FAIL: parity broken "
+            f"(sabotaged={sabotaged} "
+            f"disrupted={report.get('disrupted_trips')} "
+            f"recovered={report.get('recovered_trips')} "
+            f"failed={report.get('failed_trips')})"
+        )
+        return 1
+    if not report.get("fleet_restored"):
+        print(
+            "FAIL: fleet not fully restored "
+            f"(before={report.get('fleet_available_before')} "
+            f"after={report.get('fleet_available_after')} "
+            f"locked={report.get('fleet_locked_after')})"
+        )
+        return 1
+    print("PASS: Sabotaged == Disrupted == Recovered, fleet fully restored")
+    return 0
 
 
 if __name__ == "__main__":

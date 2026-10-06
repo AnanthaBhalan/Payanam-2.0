@@ -97,8 +97,17 @@ def _legs_from_solution(req: RoutingRequest) -> List[Dict[str, Any]]:
                 "mode": edge.mode,
                 "travel_time_min": edge.travel_time_min,
                 "cost_inr": edge.cost_inr,
-                # the live confirmation probability the solver assumed
-                "waitlist_probability": edge.probability,
+                # ``book_train`` consumes ``waitlist_probability`` as the DROP
+                # risk; ``edge.probability`` is the on-time CONFIRMATION
+                # probability. Only a waitlisted service can drop, and then
+                # only with (1 - confirmation). Under PAYANAM_TEST_MODE the
+                # seeds pin probability=1.0, so this evaluates to 0.0
+                # everywhere and a chaos run sees only injected disruptions.
+                "waitlist_probability": (
+                    round(1.0 - float(edge.probability), 4)
+                    if edge.waitlisted
+                    else 0.0
+                ),
                 "arrival_min": visit.arrival_min,
                 "node_type": node.node_type.value if node else None,
             }

@@ -201,6 +201,28 @@ async def dispatch_cab(
     raise NoFleetAvailableError(radius_km, pickup_lon, pickup_lat)
 
 
+async def release_cab(
+    driver_id: str,
+    state: Optional[FleetState] = None,
+    drop_lon: Optional[float] = None,
+    drop_lat: Optional[float] = None,
+) -> bool:
+    """End a dispatched trip: drop the lease and return the cab to the pool.
+
+    The lease key (``SET NX EX``) self-heals abandoned holds when its TTL
+    fires, and ``reclaim_expired_locks`` sweeps the index for leases that died
+    without an explicit release -- but an explicit release is what keeps the
+    fleet capacity exact run to run. Returns False only for an unknown driver.
+    """
+    state = state or get_fleet_state()
+    ok = await state.release_driver_to(driver_id, drop_lon, drop_lat)
+    if ok:
+        log.info("released driver %s", driver_id)
+    else:
+        log.warning("release missed: unknown driver %s", driver_id)
+    return ok
+
+
 async def match_batch(
     requests: Sequence[Dict[str, Any]],
     radius_km: float = DEFAULT_RADIUS_KM,

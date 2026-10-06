@@ -259,7 +259,52 @@ async def book_cab(
     payload["pickup_lon"] = lon
     payload["pickup_lat"] = lat
     payload["dispatch_id"] = assignment["dispatch_id"]
+    # Drop-off point for release_cab: the trip ends at the destination hub,
+    # so the driver is returned to the pool where the passenger got out.
+    try:
+        drop_lon, drop_lat = hub_coords(destination)
+        payload["drop_lon"] = drop_lon
+        payload["drop_lat"] = drop_lat
+    except KeyError:
+        pass  # unknown hub: release without repositioning
     return payload
+
+
+@activity.defn
+async def release_cab(
+    itinerary_id: str,
+    driver_id: str,
+    drop_lon: Optional[float] = None,
+    drop_lat: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Release a dispatched cab back to the available pool.
+
+    Runs at trip completion (or in a ``finally``-style cleanup): deletes the
+    ``payanam:driver_lock:{driver_id}`` lease key and returns the driver to
+    the available GEO index so fleet capacity is exact run to run. Idempotent:
+    releasing an unknown or already-free driver reports ``released: False``.
+    """
+    from ..fleet.state import get_fleet_state
+
+    activity.logger.info(
+        "release_cab driver=%s itinerary=%s", driver_id, itinerary_id
+    )
+    state = get_fleet_state()
+    try:
+        ok = await state.release_driver(driver_id, drop_lon, drop_lat)
+    except Exception as exc:  # noqa: BLE001 - release must not fail a trip
+        activity.logger.warning("release_cab failed (non-fatal): %s", exc)
+        return {
+            "released": False,
+            "driver_id": driver_id,
+            "itinerary_id": itinerary_id,
+            "error": str(exc),
+        }
+    return {
+        "released": bool(ok),
+        "driver_id": driver_id,
+        "itinerary_id": itinerary_id,
+    }
 
 
 def _lookup(booking_id: str) -> Optional[Dict[str, Any]]:
@@ -432,6 +477,7 @@ ACTIVITIES = [
     book_train,
     cancel_train,
     book_cab,
+    release_cab,
     book_bus,
     solve_itinerary,
     load_transit_graph,

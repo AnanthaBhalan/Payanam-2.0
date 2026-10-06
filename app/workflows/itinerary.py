@@ -59,6 +59,7 @@ with workflow.unsafe.imports_passed_through():
         book_train,
         cancel_train,
         publish_booking_event,
+        release_cab,
         solve_itinerary,
     )
 
@@ -393,19 +394,36 @@ class ItineraryWorkflow:
             degraded_reason = None
             ctx.failure = f"{type(exc).__name__}: {exc}"
 
-        # One unwind + fallback path, two triggers: a booking failure, or a
-        # live signal that invalidated a still-pending leg.
-        if degraded_reason is not None:
-            ctx.replans += 1
-            ctx.state = "COMPENSATING"
-            await ctx.unwind()
-            await self._handle_degradation(ctx, legs, degraded_reason)
-        elif ctx.failure is not None:
-            await ctx.unwind()
-            ctx.state = "FAILED"
+        try:
+            # One unwind + fallback path, two triggers: a booking failure, or a
+            # live signal that invalidated a still-pending leg.
+            if degraded_reason is not None:
+                ctx.replans += 1
+                ctx.state = "COMPENSATING"
+                await ctx.unwind()
+                await self._handle_degradation(ctx, legs, degraded_reason)
+            elif ctx.failure is not None:
+                await ctx.unwind()
+                ctx.state = "FAILED"
 
-        # -- phase 3: best-effort telemetry (never fails the Saga) -----------
-        await self._publish_events(ctx)
+            # Trip over: give every fallback cab back BEFORE the telemetry so
+            # the fleet ledger is clean by the time observers see completion.
+            # release_cab is idempotent; when it never lands, the lease TTL
+            # plus the API's reclaim pass still free the driver.
+            await self._release_cabs(ctx)
+
+            # -- phase 3: best-effort telemetry (never fails the Saga) -------
+            await self._publish_events(ctx)
+        except BaseException:
+            # Unexpected escape (workflow cancellation, worker abort): make one
+            # best-effort release attempt, then re-raise so Temporal still sees
+            # the original failure. A terminate kills the task outright and
+            # runs no code at all -- the lease TTL is the backstop for that.
+            try:
+                await self._release_cabs(ctx)
+            except BaseException:  # noqa: BLE001 - cleanup must not mask it
+                workflow.logger.warning("release_cab cleanup failed (non-fatal)")
+            raise
 
         # Plain dict: the workflow must not depend on pydantic (see note above).
         return {
@@ -626,6 +644,44 @@ class ItineraryWorkflow:
             destination=leg.get("destination", ""),
             reference=receipt.get("reference", ""),
         )
+
+    async def _release_cabs(self, ctx: SagaContext) -> None:
+        """Return every fallback cab dispatched for this trip to the fleet.
+
+        Runs on the normal completion path and again from the error path in
+        ``run()``. Idempotent and strictly best-effort: the lease TTL
+        (``fleet_lock_ttl_seconds``) plus the API's reclaim pass still free a
+        driver whose release never lands, so no failure here -- including
+        workflow cancellation -- may abort the trip.
+        """
+        released = 0
+        for receipt in ctx.booked:
+            if str(receipt.get("kind") or "").upper() != "CAB":
+                continue
+            driver_id = str(receipt.get("driver_id") or "")
+            if not driver_id:
+                continue  # stub receipts carry no dispatch to unwind
+            try:
+                await workflow.execute_activity(
+                    release_cab,
+                    args=[
+                        ctx.itinerary_id,
+                        driver_id,
+                        receipt.get("drop_lon"),
+                        receipt.get("drop_lat"),
+                    ],
+                    start_to_close_timeout=timedelta(seconds=15),
+                    retry_policy=RetryPolicy(**COMPENSATION_RETRY_POLICY),
+                )
+                released += 1
+            except BaseException as exc:  # noqa: BLE001 - cleanup, never fatal
+                workflow.logger.warning(
+                    "release_cab driver=%s failed (non-fatal): %s", driver_id, exc
+                )
+        if released:
+            workflow.logger.info(
+                "trip over: released %s fallback cab(s) to the fleet", released
+            )
 
     async def _publish_events(self, ctx: SagaContext) -> None:
         for receipt in ctx.booked:

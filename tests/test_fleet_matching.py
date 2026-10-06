@@ -313,3 +313,128 @@ async def test_unknown_hub_is_terminal(fleet: FleetState) -> None:
     finally:
         set_fleet_state(None)
 
+
+# --------------------------------------------------------------------------- #
+# 6. Phase 11: leases, release-on-completion and self-healing reclaim
+# --------------------------------------------------------------------------- #
+async def test_release_cab_activity_is_registered(fleet: FleetState) -> None:
+    """Temporal raises ActivityNotRegistered at trip end otherwise.
+
+    The workflow now calls ``release_cab`` before completing; if the activity
+    is missing from ``ACTIVITIES`` the release fails silently and the driver
+    stays locked until its TTL fires -- exactly the leak Phase 11 fixes.
+    """
+    from app.workflows.activities import ACTIVITIES
+
+    assert "release_cab" in {a.__name__ for a in ACTIVITIES}
+
+
+async def test_reclaim_expired_locks_restores_orphaned_driver(
+    fleet: FleetState,
+) -> None:
+    """A lease that dies without ``release_cab`` must self-heal (Phase 11)."""
+    assignment = await dispatch_cab(
+        CHENNAI_LON, CHENNAI_LAT, "tourist-A", 15.0, state=fleet
+    )
+    did = assignment["driver_id"]
+    assert await fleet.locked_count() == 1
+
+    # Simulate TTL expiry: the lease key is gone but the driver hash and GEO
+    # index still say ASSIGNED -- the exact orphan state Phase 10 leaked into.
+    await fleet.redis.delete(fleet.lock_key(did))
+    assert await fleet.reclaim_expired_locks() == 1
+
+    driver = await fleet.get_driver(did)
+    assert driver["status"] == AVAILABLE
+    assert await fleet.available_count() == 5
+    assert await fleet.locked_count() == 0
+
+    # A second pass finds nothing to do (idempotent janitor).
+    assert await fleet.reclaim_expired_locks() == 0
+
+
+async def test_live_lease_is_not_reclaimed(fleet: FleetState) -> None:
+    """The reclaim pass must never steal a genuinely held driver."""
+    assignment = await dispatch_cab(
+        CHENNAI_LON, CHENNAI_LAT, "tourist-A", 15.0, state=fleet
+    )
+    did = assignment["driver_id"]
+    assert await fleet.redis.exists(fleet.lock_key(did))
+
+    assert await fleet.reclaim_expired_locks() == 0
+    driver = await fleet.get_driver(did)
+    assert driver["status"] == ASSIGNED
+    assert await fleet.locked_count() == 1
+
+
+async def test_available_ping_clears_stale_lease(fleet: FleetState) -> None:
+    """A driver reporting AVAILABLE must be immediately dispatchable.
+
+    Without this, a leftover ``SET NX`` lease poisons the driver: every
+    future claim loses on the lease until the old TTL fires, so re-seeding
+    the fleet could not repair a leaked run.
+    """
+    assignment = await dispatch_cab(
+        CHENNAI_LON, CHENNAI_LAT, "tourist-A", 15.0, state=fleet
+    )
+    did = assignment["driver_id"]
+    assert await fleet.redis.exists(fleet.lock_key(did))
+
+    # The trip ended elsewhere; the driver pings back with its new position.
+    await fleet.update_driver_location(did, 78.1193, 9.9252, AVAILABLE)
+    assert not await fleet.redis.exists(fleet.lock_key(did))
+
+    # ...and is immediately claimable again (SET NX now succeeds).
+    again = await dispatch_cab(78.1193, 9.9252, "tourist-B", 15.0, state=fleet)
+    assert again["driver_id"] == did
+
+
+async def test_book_cab_carries_drop_off_coordinates(fleet: FleetState) -> None:
+    """``release_cab`` needs the destination hub to reposition the driver."""
+    from app.fleet.state import set_fleet_state
+    from app.workflows.activities import book_cab
+
+    set_fleet_state(fleet)
+    try:
+        receipt = await book_cab("itin-book-drop", "MAS", "MDU", "waitlist_dropped")
+    finally:
+        set_fleet_state(None)
+
+    assert receipt["driver_id"]
+    assert receipt["drop_lon"] == pytest.approx(78.1193)  # Madurai Junction
+    assert receipt["drop_lat"] == pytest.approx(9.9252)
+
+
+async def test_release_cab_returns_driver_to_pool(fleet: FleetState) -> None:
+    """The trip-end release: lease dropped, driver AVAILABLE, index clean."""
+    from app.fleet.state import set_fleet_state
+    from app.workflows.activities import book_cab, release_cab
+
+    set_fleet_state(fleet)
+    try:
+        receipt = await book_cab("itin-book-rel", "MAS", "MDU", "waitlist_dropped")
+        assert await fleet.locked_count() == 1
+        out = await release_cab(
+            "itin-book-rel",
+            receipt["driver_id"],
+            receipt["drop_lon"],
+            receipt["drop_lat"],
+        )
+    finally:
+        set_fleet_state(None)
+
+    assert out["released"] is True
+    driver = await fleet.get_driver(receipt["driver_id"])
+    assert driver["status"] == AVAILABLE
+    assert await fleet.available_count() == 5
+    assert await fleet.locked_count() == 0
+    assert not await fleet.redis.exists(fleet.lock_key(receipt["driver_id"]))
+
+    # Idempotent: releasing again is a harmless no-op, not an error.
+    set_fleet_state(fleet)
+    try:
+        again = await release_cab("itin-book-rel", receipt["driver_id"])
+    finally:
+        set_fleet_state(None)
+    assert again["released"] is True
+
